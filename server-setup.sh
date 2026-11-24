@@ -21,7 +21,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="0.6.3"
+readonly SCRIPT_VERSION="0.6.4"
 readonly INSTALL_PATH="/usr/local/sbin/server-setup"
 readonly LIB_DIR="/usr/local/lib/server-setup"
 readonly STATE_DIR="/etc/server-setup"
@@ -1368,6 +1368,7 @@ ssh_verify() { # ssh_verify <port>... - checks the EFFECTIVE config, not just ou
     grep -qxF "$want" <<<"$eff" || problems+=("expected '$want', effective: '$(grep -E "^${want%% *} " <<<"$eff" || echo unset)'")
   done
   grep -qE "^allowgroups( .*)? $SSH_GROUP( |\$)" <<<"$eff" || problems+=("AllowGroups does not include $SSH_GROUP")
+  if [[ -n $(ssh_stale_listeners) ]]; then problems+=("an old sshd (pid $(ssh_stale_listeners | xargs)) still holds a port with its old configuration - run: sudo server-setup ssh"); fi
   if grep -qE '^allowusers ' <<<"$eff"; then problems+=("an AllowUsers line is still active"); fi
   if (( ${#problems[@]} > 0 )); then
     for line in "${problems[@]}"; do warn "sshd: $line"; done
@@ -1410,6 +1411,7 @@ ssh_restore() { # restore the snapshot and run sshd the way it ran before
     systemctl enable --now ssh.socket
   else
     systemctl restart ssh.service
+    ssh_kill_stale_listeners
   fi
   rm -f "$ROLLBACK_DIR/applied_at"
   if [[ -f $ROLLBACK_DIR/old_ports ]]; then
@@ -1422,6 +1424,30 @@ ssh_restore() { # restore the snapshot and run sshd the way it ran before
   log_file "SSH configuration rolled back"
 }
 
+# sshd listeners that are not ssh.service's current main process. ssh.service has
+# KillMode=process, so a restart only replaces the main sshd: a listener left over from an
+# earlier start (seen: one from the package upgrade during setup) keeps its port with the OLD
+# configuration - e.g. root login - while the new sshd can't bind that port. Found on the
+# test server: port 22 still allowed root after the hardening. Sessions are never listeners.
+ssh_stale_listeners() {
+  local main pid
+  main=$(systemctl show ssh.service -p MainPID --value 2>/dev/null)
+  for pid in $(ss -Htlnp 2>/dev/null | grep '"sshd"' | grep -oE 'pid=[0-9]+' | cut -d= -f2 | sort -u); do
+    [[ $pid != "$main" ]] && printf '%s\n' "$pid"
+  done
+  return 0
+}
+ssh_kill_stale_listeners() { # stop them, then let the real sshd bind every port
+  local pids
+  pids=$(ssh_stale_listeners | xargs)
+  [[ -n $pids ]] || return 0
+  warn "Stopping sshd listener(s) left over from an earlier start (old configuration): $pids"
+  kill -TERM $pids 2>/dev/null || true
+  sleep 1
+  kill -KILL $pids 2>/dev/null || true
+  systemctl restart ssh.service
+}
+
 ssh_use_service_mode() {
   local f
   if ssh_socket_enabled || systemctl is-active --quiet ssh.socket; then
@@ -1432,6 +1458,7 @@ ssh_use_service_mode() {
   fi
   systemctl enable ssh.service >>"$LOG_FILE" 2>&1
   systemctl restart ssh.service
+  ssh_kill_stale_listeners
 }
 
 schedule_rollback() {
