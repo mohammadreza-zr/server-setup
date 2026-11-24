@@ -2,7 +2,7 @@
 
 Turn a fresh **Ubuntu or Debian** server into a **hardened server that runs for years**: production backends, Dokploy nodes and monitoring hubs. It works with normal internet access or inside an **internal network** where only a mirror is reachable, and it keeps managing the server afterwards.
 
-> **Status: phase 4 of 5.** Implemented: *base* (hardening, users, SSH, firewall, long-uptime tuning, download sources), *app* (opt-in tools, app services, backups), *monitor* (agent + stack, single server to hub) and *dokploy-node*. *fleet* comes next.
+> **Status: all 5 phases implemented (0.5.0)**: *base*, *app*, *monitor*, *dokploy-node*, *fleet*. **Not yet run as root on a real server**. See [Testing status](#testing-status) before production use.
 
 | | |
 |---|---|
@@ -164,6 +164,21 @@ sudo server-setup dokploy-node sync v0.26.0       # a newer panel: read its vers
 - **Updates:** Docker and containerd are never restarted by automatic updates, which would restart every app.
 - **Building without internet:** Dockerfile builds work, with Docker Hub images through the mirror. Nixpacks/Railpack also pull **ghcr.io** images, which Docker can't mirror. For those, add a ghcr.io proxy to Nexus and pre-pull the images, or use Dockerfiles. Builds that run npm/pip/go need the mirror URLs as build variables in Dokploy; the report prints them.
 
+## Fleet: many servers from one
+
+One server, usually the monitoring hub, manages the others over SSH. On a member, the manager's key may run **one program only**: the fleet agent, which accepts `brief`, `status`, `update`, `update-all` and `version`. The key gives no shell and no forwarding, and works only from the manager's address. sudo is allowed for exactly that program.
+
+```bash
+# on the manager
+sudo server-setup fleet init                       # prints the join command
+sudo server-setup fleet add web-1 10.0.0.11
+sudo server-setup fleet status                     # one table: uptime, load, memory, disk, reboot needed, updates, failed services
+sudo server-setup fleet update --all web-1 web-2   # or every server
+sudo server-setup fleet show web-1                 # its full status
+# on each managed server
+sudo server-setup fleet join "ssh-ed25519 AAAA... server-setup-fleet@hub" --from 10.0.0.5
+```
+
 ## Commands
 
 ```text
@@ -180,6 +195,8 @@ apps list | add <name> --exec CMD [--port N] | remove <name>
 backup init|run|status|list
 monitor status|setup|apply|join <hub>|move-to <hub>|token|alerts
 dokploy-node prepare|status|sync [<dokploy-version>]
+fleet init | add <name> <host> [--port P] | remove <name> | list | status | show <name> | update [--all]
+fleet join "<manager key>" --from <manager IP>
 ssh [--ports "22 9011"]      Re-apply SSH hardening / change ports (auto-rollback).
 confirm                      Keep a pending SSH change now.
 ```
@@ -201,4 +218,15 @@ confirm                      Keep a pending SSH change now.
 2. ~~**app**: opt-in tools catalog, app services, restic backups~~ ✅
 3. ~~**monitor**: Alloy agent; local / hub / external stack; move-to~~ ✅
 4. ~~**dokploy-node**: Dokploy's Setup Server steps done ahead of time~~ ✅
-5. **fleet**: manage many servers from the hub.
+5. ~~**fleet**: manage many servers from the hub~~ ✅
+
+## Testing status
+
+Everything that can run without root was tested on Ubuntu 24.04:
+- **Sources:** direct apt works, and OS vs third-party sources are told apart. Checks ran against the real Nexus (it answers 401 or 404 for each repo).
+- **Configs:** every generated config parses. `docker compose config` accepts the monitoring stack. The Docker `daemon.json` variants are valid JSON. App units pass `systemd-analyze verify`.
+- **Downloads:** real downloads of the Go checksum and of the nixpacks/railpack/pack release assets, with pack's sha256 verified.
+- **Dokploy sync:** reads the versions from Dokploy's current source, and they match the built-in defaults.
+- **Fleet:** forced command, `from=` restriction and forwarding refusal tested against a real (unprivileged) sshd.
+
+**Not yet verified:** a full `setup` as root on a disposable Ubuntu 22.04/24.04 and Debian 12 VM, with internet and with internet blocked except to Nexus. That covers the SSH rollback, ufw + DOCKER-USER rules, the Alloy agent and Caddy gateway configs (checked by structure, not by the real binaries), and Dokploy's "Setup Server" on a prepared node. Run it on a test VM first.

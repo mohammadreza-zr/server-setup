@@ -21,7 +21,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="0.4.0"
+readonly SCRIPT_VERSION="0.5.0"
 readonly INSTALL_PATH="/usr/local/sbin/server-setup"
 readonly LIB_DIR="/usr/local/lib/server-setup"
 readonly STATE_DIR="/etc/server-setup"
@@ -50,7 +50,7 @@ BASE_PKGS=(
   ca-certificates curl gnupg openssl sudo openssh-server
   ufw fail2ban python3-systemd chrony unattended-upgrades needrestart apt-listchanges
   apparmor apparmor-utils logrotate
-  less vim-tiny nano htop jq rsync lsof iproute2 dnsutils netcat-openbsd bash-completion tmux
+  less vim-tiny nano htop jq rsync lsof iproute2 dnsutils netcat-openbsd bash-completion tmux bsdextrautils
 )
 
 # ---- state (loaded from $CONF_FILE when it exists) -----------------------------------------
@@ -73,6 +73,8 @@ IMG_VM="" IMG_VMALERT="" IMG_LOKI="" IMG_GRAFANA="" IMG_ALERTMANAGER="" IMG_KUMA
 # Dokploy node (dokploy-node role)
 DOKPLOY_NODE="" DOKPLOY_USER="" DOKPLOY_KEY="" DOKPLOY_PANEL_IP="" DOKPLOY_ADVERTISE_ADDR="" DOKPLOY_SWARM_PEERS=""
 TRAEFIK_VERSION="" NIXPACKS_VERSION="" RAILPACK_VERSION="" PACK_VERSION=""
+# Fleet (member side: the manager allowed to run the fleet agent here)
+FLEET_MANAGER=""
 # Per source: SRC_<name> = auto|direct|mirror|none (what the admin wants),
 #             ROUTE_<name> = direct|mirror|none (what is in use now)
 readonly SOURCES="apt ntp dockerhub ghcr dockerapt grafanaapt nodesource npm pypi go godl github"
@@ -90,7 +92,7 @@ CONF_KEYS="ADMIN_USER DEPLOY_USER SSH_PORTS SSH_ALLOW TRUSTED_IPS OPEN_PORTS AUT
   MONITOR_ALLOW MONITOR_INSECURE_TLS GRAFANA_PUBLIC ALERT_TELEGRAM_CHAT ALERT_EMAIL_TO ALERT_EMAIL_FROM ALERT_SMTP
   ALERT_SMTP_USER ALERT_WEBHOOK IMG_VM IMG_VMALERT IMG_LOKI IMG_GRAFANA IMG_ALERTMANAGER IMG_KUMA IMG_CADDY
   DOKPLOY_NODE DOKPLOY_USER DOKPLOY_KEY DOKPLOY_PANEL_IP DOKPLOY_ADVERTISE_ADDR DOKPLOY_SWARM_PEERS
-  TRAEFIK_VERSION NIXPACKS_VERSION RAILPACK_VERSION PACK_VERSION"
+  TRAEFIK_VERSION NIXPACKS_VERSION RAILPACK_VERSION PACK_VERSION FLEET_MANAGER"
 for _s in $SOURCES; do CONF_KEYS+=" SRC_$_s ROUTE_$_s"; done; unset _s
 
 # Answers of this run that are not saved
@@ -2934,6 +2936,146 @@ dokploy_sync() {
 }
 
 # ----------------------------------------------------------------------------
+# Fleet: one server (usually the monitoring hub) manages many over SSH.
+#   manager: server-setup fleet init | add | remove | list | status | show | update
+#   member:  server-setup fleet join <manager's key> --from <manager IP>
+# On a member, the manager's key may run ONE program: `server-setup fleet-agent`, which
+# accepts only: brief, status, update, update-all, version. Nothing else - no shell, no
+# forwarding, only from the manager's address.
+# ----------------------------------------------------------------------------
+readonly FLEET_DIR="$STATE_DIR/fleet"
+readonly FLEET_KEY="$STATE_DIR/fleet/id_ed25519"
+readonly FLEET_HOSTS="$STATE_DIR/fleet/servers"
+readonly FLEET_USER="fleet"
+
+fleet_brief() { # one line about this server, for the manager's table (tab-separated)
+  local mem disk why sec failed
+  os_detect
+  mem=$(awk '/^MemTotal:/ {t=$2} /^MemAvailable:/ {a=$2} END {printf "%d", 100 - 100 * a / t}' /proc/meminfo)
+  disk=$(df -P -x tmpfs -x devtmpfs -x overlay -x squashfs 2>/dev/null | awk 'NR > 1 {gsub("%", "", $5); if ($5 > m) m = $5} END {print m + 0}')
+  why=$(os_reboot_reason)
+  sec=$(apt-get -s -o Debug::NoLocking=1 upgrade 2>/dev/null | grep -c '^Inst .*-security' || true)
+  failed=$(systemctl --failed --plain --no-legend 2>/dev/null | wc -l)
+  printf '%s\t%s %s\t%s\t%s\t%s%%\t%s%%\t%s\t%s\t%s\t%s\n' "$(hostname -s)" "$OS_ID" "$OS_VERSION" "$(uptime -p | sed 's/^up //; s/ years\?/y/; s/ weeks\?/w/; s/ days\?/d/; s/ hours\?/h/; s/ minutes\?/m/g; s/,//g')" \
+    "$(cut -d' ' -f3 /proc/loadavg)" "$mem" "$disk" "$([[ -n $why ]] && echo yes || echo no)" "${sec:-0}" "$failed" "$SCRIPT_VERSION"
+}
+
+# the forced command on a member (runs as root through sudo)
+cmd_fleet_agent() {
+  local req=${SSH_ORIGINAL_COMMAND-}
+  case $req in
+    brief) fleet_brief ;;
+    status) cmd_status 2>&1 | sed 's/\x1b\[[0-9;]*m//g' ;;
+    update) cmd_update 2>&1 | sed 's/\x1b\[[0-9;]*m//g' ;;
+    update-all) cmd_update --all 2>&1 | sed 's/\x1b\[[0-9;]*m//g' ;;
+    version) printf 'server-setup %s\n' "$SCRIPT_VERSION" ;;
+    *) printf 'fleet-agent: not allowed: %s (allowed: brief status update update-all version)\n' "${req:-(nothing)}" >&2; exit 2 ;;
+  esac
+}
+
+fleet_join() { # make this server a member: the manager's key may run fleet-agent only
+  local key="" from="" home opts a
+  while (( $# > 0 )); do
+    case $1 in --from) from=${2-}; shift ;; -*) die "Unknown option $1" ;; *) key+="${key:+ }$1" ;; esac
+    shift
+  done
+  key=$(normalize_pubkey "$key") || die "usage: server-setup fleet join \"ssh-ed25519 AAAA... server-setup-fleet@hub\" --from <manager IP>"
+  [[ -n $from ]] || die "--from <manager IP> is required: the key only works from there."
+  valid_ip_list "$from" || exit 1
+  ensure_group "$SSH_GROUP"
+  id "$FLEET_USER" &>/dev/null || useradd --create-home --user-group --shell /bin/sh "$FLEET_USER"
+  usermod -p '*' "$FLEET_USER"; usermod -aG "$SSH_GROUP" "$FLEET_USER"
+  home=$(home_of "$FLEET_USER"); chmod 750 "$home"
+  opts="from=\"$from\",command=\"sudo -n $INSTALL_PATH fleet-agent\",no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty,no-user-rc"
+  runuser -u "$FLEET_USER" -- sh -c 'umask 077; mkdir -p "$1/.ssh"' sh "$home"
+  printf '%s %s\n' "$opts" "$key" | runuser -u "$FLEET_USER" -- tee "$home/.ssh/authorized_keys" >/dev/null
+  # sudo for exactly that program (no arguments), keeping the request the manager sent
+  cat >/etc/sudoers.d/70-server-setup-fleet <<EOF
+# Managed by server-setup: the fleet manager may run the fleet agent, nothing else
+Defaults:$FLEET_USER env_keep += "SSH_ORIGINAL_COMMAND"
+$FLEET_USER ALL=(root) NOPASSWD: $INSTALL_PATH fleet-agent
+EOF
+  chmod 440 /etc/sudoers.d/70-server-setup-fleet
+  visudo -cq || { rm -f /etc/sudoers.d/70-server-setup-fleet; die "sudoers check failed - not joined."; }
+  if [[ -n $SSH_ALLOW ]]; then SSH_ALLOW=$(uniq_words $SSH_ALLOW $from); save_config; step_firewall; fi
+  FLEET_MANAGER=$from; save_config
+  ok "This server can now be managed by the fleet manager at $from (status and updates only)."
+}
+
+fleet_ssh() { # fleet_ssh <host> <port> <request>
+  ssh -n -i "$FLEET_KEY" -p "$2" -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 \
+    -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$FLEET_DIR/known_hosts" \
+    -o IdentitiesOnly=yes "$FLEET_USER@$1" "$3"
+}
+fleet_each() { # fleet_each [names...] - prints "name host port" lines (all, or those named)
+  [[ -s $FLEET_HOSTS ]] || die "No servers yet: server-setup fleet add <name> <host> [--port P]"
+  if (( $# == 0 )); then grep -vE '^[[:space:]]*(#|$)' "$FLEET_HOSTS"; return 0; fi
+  local n line found
+  for n in "$@"; do
+    found=$(awk -v n="$n" '$1 == n' "$FLEET_HOSTS")
+    [[ -n $found ]] || die "No server '$n' (server-setup fleet list)."
+    printf '%s\n' "$found"
+  done
+}
+
+cmd_fleet() {
+  local action=${1-}; if (( $# > 0 )); then shift; fi
+  case $action in
+    join) fleet_join "$@"; return ;;
+  esac
+  install -d -m 700 "$FLEET_DIR"
+  case $action in
+    init)
+      if [[ ! -f $FLEET_KEY ]]; then ssh-keygen -q -t ed25519 -N '' -C "server-setup-fleet@$(hostname -s)" -f "$FLEET_KEY"; fi
+      touch "$FLEET_HOSTS"; chmod 600 "$FLEET_HOSTS"
+      ok "This server is a fleet manager. On every server to manage, run:"
+      printf '\n    sudo server-setup fleet join "%s" --from %s\n\n' "$(cat "$FLEET_KEY.pub")" "$(server_ip)" ;;
+    add)
+      [[ -f $FLEET_KEY ]] || die "Run 'server-setup fleet init' first."
+      local name=${1-} host=${2-} port=22; shift 2 2>/dev/null || true
+      [[ ${1-} == --port ]] && port=${2-22}
+      [[ $name =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$ && -n $host ]] || die "usage: server-setup fleet add <name> <host> [--port P]"
+      valid_host_list "$host" || exit 1; valid_port_number "$port" || exit 1
+      if awk -v n="$name" '$1 == n {f=1} END {exit !f}' "$FLEET_HOSTS" 2>/dev/null; then die "'$name' is already in the fleet."; fi
+      local v; v=$(fleet_ssh "$host" "$port" version 2>&1) || die "Could not reach $name ($host:$port) as '$FLEET_USER': $v
+  On $name: sudo server-setup fleet join \"$(cat "$FLEET_KEY.pub")\" --from $(server_ip)"
+      printf '%s %s %s\n' "$name" "$host" "$port" >>"$FLEET_HOSTS"
+      ok "Added $name ($host:$port) - $v" ;;
+    remove)
+      [[ -n ${1-} ]] || die "usage: server-setup fleet remove <name>"
+      awk -v n="$1" '$1 != n' "$FLEET_HOSTS" >"$FLEET_HOSTS.new" && mv -f "$FLEET_HOSTS.new" "$FLEET_HOSTS"; chmod 600 "$FLEET_HOSTS"
+      ok "Removed $1 from the fleet (on it: sudo userdel -r $FLEET_USER; sudo rm /etc/sudoers.d/70-server-setup-fleet)." ;;
+    list|"") [[ -s $FLEET_HOSTS ]] && column -t "$FLEET_HOSTS" | sed 's/^/    /' || info "No servers yet: server-setup fleet add <name> <host>" ;;
+    status)
+      local out; out=$(mktemp -d)
+      local name host port
+      while read -r name host port _; do
+        # rows go to <name>.row, errors to <name>.err - only rows are shown
+        # the inventory name leads the row (not the server's own hostname)
+        ( fleet_ssh "$host" "$port" brief 2>"$out/$name.err" | awk -v n="$name" 'BEGIN {FS = OFS = "\t"} {$1 = n; print}' >"$out/$name.row" \
+          && [[ -s $out/$name.row ]] \
+          || printf '%s\tUNREACHABLE\t%s\n' "$name" "$(grep -v '^Warning: Permanently added' "$out/$name.err" | tr '\n' ' ' | cut -c1-70)" >"$out/$name.row" ) &
+      done < <(fleet_each "$@")
+      wait
+      { printf 'SERVER\tOS\tUP\tLOAD\tMEM\tDISK\tREBOOT\tSEC-UPD\tFAILED\tVERSION\n'; cat "$out"/*.row 2>/dev/null | grep -v '^$'; } | column -t -s $'\t' | sed 's/^/    /'
+      rm -rf "$out" ;;
+    show)
+      [[ -n ${1-} ]] || die "usage: server-setup fleet show <name>"
+      local name host port; read -r name host port _ < <(fleet_each "$1")
+      fleet_ssh "$host" "$port" status ;;
+    update)
+      local req=update names=() a
+      for a in "$@"; do case $a in --all) req=update-all ;; *) names+=("$a") ;; esac; done
+      local name host port
+      while read -r name host port _; do
+        step "$name ($host)"
+        fleet_ssh "$host" "$port" "$req" 2>&1 | sed 's/^/    /' || warn "$name: update failed or unreachable."
+      done < <(fleet_each "${names[@]}") ;;
+    *) die "usage: server-setup fleet init | add <name> <host> [--port P] | remove <name> | list | status [names] | show <name> | update [--all] [names]   (member: fleet join <key> --from <IP>)" ;;
+  esac
+}
+
+# ----------------------------------------------------------------------------
 # Setup
 # ----------------------------------------------------------------------------
 collect_answers() {
@@ -3215,6 +3357,8 @@ cmd_status() {
   step "Logs"; info "journal $(journalctl --disk-usage 2>/dev/null | grep -oE '[0-9.]+[KMGT]' | head -1) of $JOURNAL_MAX"
   if [[ $MONITOR != none ]]; then step "Monitoring"; cmd_monitor status; fi
   if [[ $DOKPLOY_NODE == y ]]; then step "Dokploy node"; cmd_dokploy_node status; fi
+  if [[ -s $FLEET_HOSTS ]]; then step "Fleet"; info "Manager of $(grep -cvE '^[[:space:]]*(#|$)' "$FLEET_HOSTS") server(s): server-setup fleet status"; fi
+  if [[ -n $FLEET_MANAGER ]]; then step "Fleet"; info "Managed by the fleet manager at $FLEET_MANAGER (status and updates only)."; fi
   [[ -n $TOOLS ]] && { step "Tools"; info "$TOOLS"; }
   return 0
 }
@@ -3305,6 +3449,12 @@ server-setup $SCRIPT_VERSION - hardened Ubuntu/Debian servers, online or interna
                                ahead of time (through the mirror when needed). sync: match a newer
                                panel's Traefik/nixpacks/railpack/pack versions.
   monitor status|setup|apply|join <hub>|move-to <hub>|token|alerts
+  fleet init | add <name> <host> [--port P] | remove <name> | list | status [names]
+        | show <name> | update [--all] [names]
+                               Manage many servers from this one (usually the monitoring hub).
+  fleet join "<manager key>" --from <manager IP>
+                               On each managed server: the manager's key may only run the fleet
+                               agent (status and updates), only from the manager's address.
                                Grafana Alloy agent on every server; the stack (VictoriaMetrics,
                                Loki, Grafana, Alertmanager, Uptime Kuma) here (local), as a hub
                                for many servers, or an existing one (external). move-to: a
@@ -3362,6 +3512,8 @@ main() {
     backup)   cmd_backup "$@" ;;
     monitor)  cmd_monitor "$@" ;;
     dokploy-node) cmd_dokploy_node "$@" ;;
+    fleet)    cmd_fleet "$@" ;;
+    fleet-agent) cmd_fleet_agent ;;
     confirm)  ssh_change_pending || die "No SSH change is pending."; ssh_finalize; ok "SSH change kept (ports $SSH_PORTS)." ;;
     *) usage >&2; exit 2 ;;
   esac
