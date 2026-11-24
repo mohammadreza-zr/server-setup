@@ -21,7 +21,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="0.5.1"
+readonly SCRIPT_VERSION="0.5.2"
 readonly INSTALL_PATH="/usr/local/sbin/server-setup"
 readonly LIB_DIR="/usr/local/lib/server-setup"
 readonly STATE_DIR="/etc/server-setup"
@@ -1042,11 +1042,14 @@ apply_firewall() { # apply_firewall <ssh port>...
   for spec in $OPEN_PORTS; do
     [[ $spec == */* ]] || spec="$spec/tcp"
     ufw allow "$spec" comment 'server-setup open port' >>"$LOG_FILE"
-    # containers that publish this port are reachable too (Docker's ports pass DOCKER-USER)
-    if os_installed docker-ce; then ufw route allow proto "${spec#*/}" from any to any port "${spec%/*}" >>"$LOG_FILE" 2>&1 || true; fi
+    # (older versions also added a ufw route rule here - matched on the CONTAINER port, it let
+    #  any container listening on that port through on any published port: removed)
+    ufw route delete allow proto "${spec#*/}" from any to any port "${spec%/*}" >>"$LOG_FILE" 2>&1 || true
   done
   ufw logging low >>"$LOG_FILE" 2>&1 || true
   ufw --force enable >>"$LOG_FILE"
+  # containers' published ports follow the same open ports (rules in Docker's DOCKER-USER chain)
+  if os_installed docker-ce; then apply_ufw_docker; fi
   note "Firewall: incoming blocked except SSH ($*${SSH_ALLOW:+ from $SSH_ALLOW})${OPEN_PORTS:+ and $OPEN_PORTS for everyone}."
 }
 step_firewall() { apply_firewall $(uniq_words $(current_ssh_ports) $SSH_PORTS); }
@@ -1666,13 +1669,16 @@ EOF
 }
 
 # Docker publishes ports with its own iptables rules, past ufw. These rules (in DOCKER-USER)
-# let containers talk out and to each other, and let in from outside only what
-# `server-setup firewall allow` opened (ufw route rules) - everything else is dropped.
+# let containers talk out and to each other, and let in from outside only the HOST ports that
+# `server-setup firewall allow` opened - everything else is dropped. Docker has already
+# rewritten the destination to the container's port when these rules run, so they match the
+# port the client originally asked for (conntrack --ctorigdstport): "-p 8080:80" is reachable
+# only if 8080 is open, whatever port the container listens on inside.
 render_ufw_docker() {
+  local spec src
   cat <<'EOF'
 # BEGIN server-setup docker
 *filter
-:ufw-user-forward - [0:0]
 :server-setup-docker-deny - [0:0]
 :DOCKER-USER - [0:0]
 -F DOCKER-USER
@@ -1681,7 +1687,19 @@ render_ufw_docker() {
 -A DOCKER-USER -i docker0 -j RETURN
 -A DOCKER-USER -i br-+ -j RETURN
 -A DOCKER-USER -i docker_gwbridge -j RETURN
--A DOCKER-USER -j ufw-user-forward
+EOF
+  for spec in $OPEN_PORTS; do
+    [[ $spec == */* ]] || spec="$spec/tcp"
+    printf -- '-A DOCKER-USER -p %s -m conntrack --ctorigdstport %s -j RETURN\n' "${spec#*/}" "${spec%/*}"
+  done
+  if [[ ${MONITOR-} == hub ]]; then
+    if [[ -n ${MONITOR_ALLOW-} ]]; then
+      for src in $MONITOR_ALLOW; do printf -- '-A DOCKER-USER -s %s -p tcp -m conntrack --ctorigdstport %s -j RETURN\n' "$src" "$HUB_PORT"; done
+    else
+      printf -- '-A DOCKER-USER -p tcp -m conntrack --ctorigdstport %s -j RETURN\n' "$HUB_PORT"
+    fi
+  fi
+  cat <<'EOF'
 -A DOCKER-USER -m conntrack --ctstate NEW -j server-setup-docker-deny
 -A DOCKER-USER -j RETURN
 -A server-setup-docker-deny -m limit --limit 3/min --limit-burst 10 -j LOG --log-prefix "[UFW DOCKER BLOCK] "
@@ -1699,7 +1717,6 @@ apply_ufw_docker() {
   render_ufw_docker >>"$tmp"
   install -m 640 "$tmp" "$f"; rm -f "$tmp"
   ufw reload >>"$LOG_FILE" 2>&1 || die "ufw did not accept the Docker rules (see $LOG_FILE)."
-  step_firewall   # adds the route rules for the open ports, now that Docker is here
 }
 
 install_docker() { # install_docker [swarm:y|n]
@@ -2264,7 +2281,18 @@ EOF
   "$LIB_DIR/textfile" || true
   # what the agent may read: the journal; Docker's socket (= root on this host) only for containers
   usermod -aG systemd-journal,adm alloy 2>/dev/null || true
-  if os_installed docker-ce; then docker=y; usermod -aG docker alloy; fi
+  # Container stats (cAdvisor) need root to read Docker's state - tested: as the 'alloy' user
+  # only the host's root cgroup is seen. The docker socket it needs is root-equivalent anyway,
+  # so with Docker the agent runs as root; without Docker it stays an unprivileged user.
+  install -d /etc/systemd/system/alloy.service.d
+  if os_installed docker-ce; then
+    docker=y
+    printf '# Managed by server-setup: container metrics need root (see install_agent)\n[Service]\nUser=root\nGroup=root\n' \
+      >/etc/systemd/system/alloy.service.d/90-server-setup.conf
+  else
+    rm -f /etc/systemd/system/alloy.service.d/90-server-setup.conf
+  fi
+  systemctl daemon-reload
   local pw; pw=$(secret_get monitor-password || true)
   # local/hub push to this server's own stack on 127.0.0.1 (no login); external may need one
   if [[ $MONITOR == external && -n $pw && -n $MONITOR_USER ]]; then auth=y; fi
@@ -2279,7 +2307,7 @@ EOF
   sleep 3
   systemctl is-active --quiet alloy || { journalctl -u alloy -n 20 --no-pager >&2; die "The monitoring agent (alloy) did not start - see above."; }
   note "Monitoring agent: Grafana Alloy -> $(mon_metrics_url) (metrics) and $(mon_logs_url) (logs)$([[ $docker == y ]] && echo ', containers included')."
-  [[ $docker == y ]] && note "  The agent is in the docker group to read container stats and logs (that group is root-equivalent)."
+  if [[ $docker == y ]]; then note "  With Docker the agent runs as root: container stats need it (and Docker's socket is root-equivalent anyway)."; fi
 }
 
 # ---- the stack ---------------------------------------------------------------
@@ -2477,7 +2505,7 @@ render_alertmanager() {
 
 render_grafana_provisioning() { # writes the datasource and dashboard provisioning into <dir>
   local d=$1
-  install -d -m 755 "$d/datasources" "$d/dashboards"
+  install -d -m 755 "$d/datasources" "$d/dashboards" "$d/plugins" "$d/alerting"   # the last two empty: Grafana expects them
   cat >"$d/datasources/server-setup.yaml" <<'EOF'
 apiVersion: 1
 datasources:
@@ -2627,18 +2655,15 @@ EOF
   run "Pulling the monitoring images" docker compose -f "$MON_DIR/compose.yaml" pull
   run "Starting the monitoring stack" docker compose -f "$MON_DIR/compose.yaml" up -d --remove-orphans
   if [[ $hub == y ]]; then
-    local src
-    if [[ -n ${MONITOR_ALLOW-} ]]; then
-      for src in $MONITOR_ALLOW; do ufw route allow proto tcp from "$src" to any port "$HUB_PORT" comment 'monitoring agents' >>"$LOG_FILE" 2>&1; done
-    else
-      ufw route allow proto tcp from any to any port "$HUB_PORT" comment 'monitoring agents' >>"$LOG_FILE" 2>&1
+    apply_ufw_docker   # the hub's port, for the allowed agents (MONITOR_ALLOW) only
+    if [[ -z ${MONITOR_ALLOW-} ]]; then
       warn "The hub's port $HUB_PORT is open to everyone (it needs the agent login). Limit it: MONITOR_ALLOW in $CONF_FILE, then server-setup monitor apply"
     fi
   fi
   save_config
   note "Monitoring stack ($MONITOR) in $MON_DIR: VictoriaMetrics ($MONITOR_RETENTION), Loki ($LOG_RETENTION), Grafana, vmalert + Alertmanager, Uptime Kuma."
   note "  Grafana: ssh -L 3000:127.0.0.1:3000 $(hostname -s) -> http://localhost:3000 (admin / see credentials). Uptime Kuma: ssh -L 3001:127.0.0.1:3001 -> http://localhost:3001"
-  [[ $hub == y ]] && note "  Hub: agents push to https://$MONITOR_HUB_ADDR:$HUB_PORT - on each server: sudo server-setup monitor join https://$MONITOR_HUB_ADDR:$HUB_PORT"
+  if [[ $hub == y ]]; then note "  Hub: agents push to https://$MONITOR_HUB_ADDR:$HUB_PORT - on each server: sudo server-setup monitor join https://$MONITOR_HUB_ADDR:$HUB_PORT"; fi
 }
 
 monitor_apply() {
@@ -3302,7 +3327,9 @@ cmd_firewall() {
         ufw delete allow "$spec" >>"$LOG_FILE" 2>&1 || true
         ufw route delete allow proto "${spec#*/}" from any to any port "${spec%/*}" >>"$LOG_FILE" 2>&1 || true
       done
-      save_config; ok "Open to everyone now: ${OPEN_PORTS:-(nothing but SSH)}" ;;
+      save_config
+      if os_installed docker-ce; then apply_ufw_docker; fi
+      ok "Open to everyone now: ${OPEN_PORTS:-(nothing but SSH)}" ;;
     ssh-from)
       valid_ip_list "$*" || exit 1
       SSH_ALLOW="$*"; save_config
