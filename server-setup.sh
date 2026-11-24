@@ -21,7 +21,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="0.5.0"
+readonly SCRIPT_VERSION="0.5.1"
 readonly INSTALL_PATH="/usr/local/sbin/server-setup"
 readonly LIB_DIR="/usr/local/lib/server-setup"
 readonly STATE_DIR="/etc/server-setup"
@@ -1018,20 +1018,27 @@ step_users() {
 }
 
 # ---- firewall ------------------------------------------------------------------------------
+fw_allow_ssh_port() { # fw_allow_ssh_port <port> - open to SSH_ALLOW only (or to all when it is empty)
+  local p=$1 src
+  if [[ -n $SSH_ALLOW ]]; then
+    for src in $SSH_ALLOW; do ufw allow from "$src" to any port "$p" proto tcp comment 'SSH' >>"$LOG_FILE"; done
+    ufw delete allow "$p/tcp" >>"$LOG_FILE" 2>&1 || true
+  else
+    ufw allow "$p/tcp" comment 'SSH' >>"$LOG_FILE"
+  fi
+}
+fw_close_ssh_port() { # every rule that opened <port> for SSH, restricted or not
+  local p=$1 src
+  ufw delete allow "$p/tcp" >>"$LOG_FILE" 2>&1 || true
+  for src in $SSH_ALLOW; do ufw delete allow from "$src" to any port "$p" proto tcp >>"$LOG_FILE" 2>&1 || true; done
+}
 apply_firewall() { # apply_firewall <ssh port>...
   local p src spec
   if [[ ${UFW_RESET:-n} == y ]]; then ufw --force reset >>"$LOG_FILE" 2>&1; fi
   ufw default deny incoming >>"$LOG_FILE"
   ufw default allow outgoing >>"$LOG_FILE"
   ufw default deny routed >>"$LOG_FILE" 2>&1 || true
-  for p in "$@"; do
-    if [[ -n $SSH_ALLOW ]]; then
-      for src in $SSH_ALLOW; do ufw allow from "$src" to any port "$p" proto tcp comment 'SSH' >>"$LOG_FILE"; done
-      ufw delete allow "$p/tcp" >>"$LOG_FILE" 2>&1 || true
-    else
-      ufw allow "$p/tcp" comment 'SSH' >>"$LOG_FILE"
-    fi
-  done
+  for p in "$@"; do fw_allow_ssh_port "$p"; done
   for spec in $OPEN_PORTS; do
     [[ $spec == */* ]] || spec="$spec/tcp"
     ufw allow "$spec" comment 'server-setup open port' >>"$LOG_FILE"
@@ -1441,7 +1448,7 @@ ssh_finalize() { # keep the new SSH setup: close the old ports, update fail2ban,
   mapfile -t new < <(awk '/^Port / {print $2}' "$(ssh_dropin)")
   if [[ -f $ROLLBACK_DIR/old_ports ]]; then mapfile -t old <"$ROLLBACK_DIR/old_ports"; fi
   for p in "${old[@]}"; do
-    if [[ " ${new[*]} " != *" $p "* ]]; then ufw delete allow "$p/tcp" >>"$LOG_FILE" 2>&1 || true; fi
+    if [[ " ${new[*]} " != *" $p "* ]]; then fw_close_ssh_port "$p"; fi
   done
   apply_fail2ban "${new[@]}"
   SSH_PORTS="${new[*]}"; save_config
@@ -1493,7 +1500,7 @@ ssh_apply() { # ssh_apply <port>...
     if (( ${#up[@]} > 0 )); then note "SSH: already hardened, listening on ${up[*]} - unchanged."; return 0; fi
   fi
 
-  for p in "${ports[@]}"; do ufw allow "$p/tcp" comment 'SSH' >>"$LOG_FILE"; done
+  for p in "${ports[@]}"; do fw_allow_ssh_port "$p"; done
   ssh_snapshot
   printf '%s\n' "${old_ports[@]}" >"$ROLLBACK_DIR/old_ports"
   ssh_ensure_include
@@ -2585,7 +2592,8 @@ apply_stack() {
   local hub=n pw hash gpw
   [[ $MONITOR == hub ]] && hub=y
   os_installed docker-ce || install_tool docker
-  install -d -m 750 "$MON_DIR" "$MON_DIR/alerts" "$MON_DIR/grafana/dashboards"
+  install -d -m 700 "$MON_DIR"
+  install -d -m 755 "$MON_DIR/alerts" "$MON_DIR/grafana" "$MON_DIR/grafana/dashboards"   # read by the containers' own users
   render_compose "$hub" >"$MON_DIR/compose.yaml"
   render_loki >"$MON_DIR/loki.yaml"
   render_alert_rules >"$MON_DIR/alerts/server-setup.yml"
@@ -2966,8 +2974,10 @@ cmd_fleet_agent() {
   case $req in
     brief) fleet_brief ;;
     status) cmd_status 2>&1 | sed 's/\x1b\[[0-9;]*m//g' ;;
-    update) cmd_update 2>&1 | sed 's/\x1b\[[0-9;]*m//g' ;;
-    update-all) cmd_update --all 2>&1 | sed 's/\x1b\[[0-9;]*m//g' ;;
+    update|update-all)
+      exec 9>"$STATE_DIR/.lock"
+      flock -w 900 9 || { echo "fleet-agent: another server-setup run is still going" >&2; exit 3; }
+      if [[ $req == update ]]; then cmd_update 2>&1 | sed 's/\x1b\[[0-9;]*m//g'; else cmd_update --all 2>&1 | sed 's/\x1b\[[0-9;]*m//g'; fi ;;
     version) printf 'server-setup %s\n' "$SCRIPT_VERSION" ;;
     *) printf 'fleet-agent: not allowed: %s (allowed: brief status update update-all version)\n' "${req:-(nothing)}" >&2; exit 2 ;;
   esac
@@ -3205,6 +3215,7 @@ cmd_setup() {
   try_step "Time sync (chrony)" apply_time_sync
   try_step "Users and SSH keys" step_users
   try_step "Firewall" step_firewall
+  UFW_RESET=n   # here in the parent shell: later steps re-apply the firewall without resetting it
   try_step "fail2ban" step_fail2ban
   try_step "Kernel and system hardening" apply_hardening
   try_step "Long-uptime tuning (limits, network, swap, zswap)" apply_uptime_tuning
@@ -3488,8 +3499,13 @@ main() {
     fi
     return 0
   fi
+  # read-only requests: no lock, no report rewrite, and a running setup's notes and
+  # credential list are left alone
   case $cmd in
-    status) ;;
+    fleet-agent) cmd_fleet_agent; return 0 ;;
+    status) cmd_status; return 0 ;;
+  esac
+  case $cmd in
     *)
       exec 9>"$STATE_DIR/.lock"
       flock -n 9 || die "Another server-setup run is still going. If it runs in tmux: sudo tmux attach -t server-setup"

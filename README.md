@@ -2,7 +2,7 @@
 
 Turn a fresh **Ubuntu or Debian** server into a **hardened server that runs for years**: production backends, Dokploy nodes and monitoring hubs. It works with normal internet access or inside an **internal network** where only a mirror is reachable, and it keeps managing the server afterwards.
 
-> **Status: all 5 phases implemented (0.5.0)**: *base*, *app*, *monitor*, *dokploy-node*, *fleet*. **Not yet run as root on a real server**. See [Testing status](#testing-status) before production use.
+> **Status: all 5 phases implemented (0.5.1)**: *base*, *app*, *monitor*, *dokploy-node*, *fleet*. **Not yet run as root on a real server**. See [Testing status](#testing-status) before production use.
 
 | | |
 |---|---|
@@ -229,4 +229,4 @@ Everything that can run without root was tested on Ubuntu 24.04:
 - **Dokploy sync:** reads the versions from Dokploy's current source, and they match the built-in defaults.
 - **Fleet:** forced command, `from=` restriction and forwarding refusal tested against a real (unprivileged) sshd.
 
-**Not yet verified:** a full `setup` as root on a disposable Ubuntu 22.04/24.04 and Debian 12 VM, with internet and with internet blocked except to Nexus. That covers the SSH rollback, ufw + DOCKER-USER rules, the Alloy agent and Caddy gateway configs (checked by structure, not by the real binaries), and Dokploy's "Setup Server" on a prepared node. Run it on a test VM first.
+**Not yet verified:** a full `setup` as root on a disposable Ubuntu 22.04/24.04 and Debian 12 VM, with internet and with internet blocked except to Nexus. That covers the SSH rollback, ufw + DOCKER-USER rules, the Alloy agent and Caddy gateway configs (checked by structure, not by the real binaries), and Dokploy's "Setup Server" on a prepared node. On that test, also check whether the panel needs SSH forwarding for anything beyond running commands. Its key is set to `no-port-forwarding`. Run it on a test VM first.
