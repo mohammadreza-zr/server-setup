@@ -21,7 +21,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="0.6.1"
+readonly SCRIPT_VERSION="0.6.2"
 readonly INSTALL_PATH="/usr/local/sbin/server-setup"
 readonly LIB_DIR="/usr/local/lib/server-setup"
 readonly STATE_DIR="/etc/server-setup"
@@ -925,7 +925,7 @@ mirror_apply_all() {
   render_client_mirrors
   if os_installed docker-ce; then
     render_daemon_json "$(docker_swarm_active && echo y || echo n)" >/etc/docker/daemon.json
-    systemctl restart docker; docker_login_mirror
+    docker_restart; docker_login_mirror
   fi
   local line=""; for s in $SOURCES; do [[ $(route_of "$s") != unset ]] && line+="$s $(route_of "$s"), "; done
   ok "Sources: ${line%, }"
@@ -1720,6 +1720,22 @@ apply_ufw_docker() {
   ufw reload >>"$LOG_FILE" 2>&1 || die "ufw did not accept the Docker rules (see $LOG_FILE)."
 }
 
+# docker_restart - restart Docker and bring back every container that should be running.
+# (Tested: switching live-restore off for Swarm stopped all containers, and their
+# 'unless-stopped' policy did not start them again.)
+docker_restart() {
+  local c pol
+  systemctl restart docker
+  sleep 3
+  for c in $(docker ps -aq --filter status=exited --filter status=created 2>/dev/null); do
+    pol=$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$c" 2>/dev/null)
+    if [[ $pol == always || $pol == unless-stopped ]]; then docker start "$c" >>"$LOG_FILE" 2>&1 || warn "Container $c did not start again after the Docker restart."; fi
+  done
+  if [[ -f $MON_DIR/compose.yaml ]] && mon_stack_here; then
+    docker compose -f "$MON_DIR/compose.yaml" up -d >>"$LOG_FILE" 2>&1 || warn "The monitoring stack did not come back after the Docker restart."
+  fi
+}
+
 install_docker() { # install_docker [swarm:y|n]
   local p
   if ! os_installed docker-ce; then
@@ -1733,7 +1749,7 @@ install_docker() { # install_docker [swarm:y|n]
   render_daemon_json "${1:-n}" >/etc/docker/daemon.json.new
   if ! cmp -s /etc/docker/daemon.json.new /etc/docker/daemon.json 2>/dev/null; then
     mv -f /etc/docker/daemon.json.new /etc/docker/daemon.json
-    systemctl enable docker >>"$LOG_FILE" 2>&1; systemctl restart docker
+    systemctl enable docker >>"$LOG_FILE" 2>&1; docker_restart
   else rm -f /etc/docker/daemon.json.new; fi
   docker_login_mirror
   apply_ufw_docker
@@ -3215,7 +3231,7 @@ EOF
   if os_installed docker-ce; then
     render_daemon_json "$(docker_swarm_active && echo y || echo n)" >/etc/docker/daemon.json.new
     if ! cmp -s /etc/docker/daemon.json.new /etc/docker/daemon.json; then
-      mv -f /etc/docker/daemon.json.new /etc/docker/daemon.json; systemctl restart docker
+      mv -f /etc/docker/daemon.json.new /etc/docker/daemon.json; docker_restart
       note "Docker: new containers start in apps.slice (running ones move there when they are re-created)."
     else rm -f /etc/docker/daemon.json.new; fi
   fi
