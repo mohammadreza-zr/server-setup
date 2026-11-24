@@ -21,7 +21,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="0.6.0"
+readonly SCRIPT_VERSION="0.6.1"
 readonly INSTALL_PATH="/usr/local/sbin/server-setup"
 readonly LIB_DIR="/usr/local/lib/server-setup"
 readonly STATE_DIR="/etc/server-setup"
@@ -3744,12 +3744,20 @@ main() {
     rescue) cmd_rescue "$@"; return 0 ;;
   esac
   case $cmd in
+    fleet) [[ ${1-} == join ]] && { exec 9>"$STATE_DIR/.lock"; flock -n 9 || die "Another server-setup run is still going."; } ;;
+      # the manager's fleet commands work on OTHER servers: holding this server's lock would
+      # deadlock when the manager is also a member of its own fleet (its agent waits for it)
     *)
       exec 9>"$STATE_DIR/.lock"
       flock -n 9 || die "Another server-setup run is still going. If it runs in tmux: sudo tmux attach -t server-setup"
       ;;
   esac
-  case $cmd in setup|status|help|report) ;; *) REFRESH_FOR="$cmd $*" ;; esac
+  # only commands that change something rewrite the report (not list/show/status/test views)
+  case $cmd in
+    setup|status|help|report) ;;
+    *) case ${1-} in ""|list|show|status|test|token) [[ $cmd == firewall || $cmd == users || $cmd == tools || $cmd == apps || $cmd == fleet || $cmd == mirror || $cmd == monitor || $cmd == backup || $cmd == dokploy-node ]] || REFRESH_FOR="$cmd $*" ;;
+         *) REFRESH_FOR="$cmd $*" ;; esac ;;
+  esac
   begin_run
   trap end_run EXIT
   case $cmd in
