@@ -105,8 +105,9 @@ sudo server-setup rescue restore      # put the ballast back when it's fixed
 | 8 CPU hogs on 2 CPUs (CPU pressure 85%) | 2.0 s |
 | 5 GB of memory wanted on 3.9 GB RAM (memory pressure up to 90%, swap 3.4 GB) | 2.1–2.9 s |
 | disk 100% full (including root's reserve) | 4.5 s, then 2.2 s |
+| 9 GB of memory wanted on 3.9 GB RAM + 3.9 GB swap | 0.7–1.5 s, and **systemd-oomd killed only that app** once swap was full; SSH, Docker, the agent and the monitoring stack all survived |
 
-`rescue freeze` took the CPU hogs to 0% instantly. SSH, journald, Docker and the monitoring stack stayed up in every test.
+Login times vary with the network between runs (the idle baseline was 0.7–2.0 s). Apps may use all of the swap: the OOM guard acts when swap is 90% full. The container port filter is IPv4; Docker's IPv6 is not enabled here. `rescue freeze` took the CPU hogs to 0% instantly. SSH, journald, Docker and the monitoring stack stayed up in every test.
 
 ## Tools (app role): opt-in
 
