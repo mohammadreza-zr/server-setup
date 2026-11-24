@@ -2,7 +2,7 @@
 
 Turn a fresh **Ubuntu or Debian** server into a **hardened server that runs for years**: production backends, Dokploy nodes and monitoring hubs. It works with normal internet access or inside an **internal network** where only a mirror is reachable, and it keeps managing the server afterwards.
 
-> **Status: all 5 phases implemented (0.5.1)**: *base*, *app*, *monitor*, *dokploy-node*, *fleet*. **Not yet run as root on a real server**. See [Testing status](#testing-status) before production use.
+> **Status: 0.6.0.** All 5 roles are implemented, plus "under pressure" management. Tested on a real Ubuntu 24.04 server: base, app, monitor, and the CPU / memory / disk-full stress tests. See [Testing status](#testing-status).
 
 | | |
 |---|---|
@@ -74,6 +74,39 @@ A mirror login is stored root-only (`/etc/server-setup/secrets`, apt's `auth.con
   - Security updates install daily, and services that use updated libraries restart by themselves (needrestart).
   - **No automatic reboot** by default: `status` tells you when one is needed and why. Ubuntu Pro Livepatch (kernel fixes without a reboot) is optional where Canonical is reachable.
 - **Time:** chrony, with public pools or your internal NTP servers.
+
+## Under pressure: you can always get in and fix it
+
+A server that runs for years will one day have a full disk, a memory leak or a runaway process. server-setup makes sure the admin can still log in and act:
+
+- **Every workload runs in `apps.slice`**: app services and every Docker container (Docker's `cgroup-parent`). Apps are slowed down above *RAM − 2 × reserve* and can never take the last *reserve* (5% of RAM, 256 MB–1 GB).
+- **SSH and admin sessions** get 10× the CPU and disk-I/O priority of the apps, and guaranteed memory. The kernel's OOM killer never picks sshd.
+- **The monitoring stack** runs in its own `monitoring.slice`, so it keeps reporting while the apps misbehave.
+- **systemd-oomd** watches only `apps.slice`. If apps thrash (80% memory pressure for 20 s) or swap is 90% full, the heaviest app is ended. SSH, admin sessions and system services are never touched.
+- **A ballast file** (2% of the disk, 256 MB–2 GB) holds space in reserve. `rescue free-space` frees it at once when the disk fills.
+
+```bash
+sudo server-setup rescue              # what is eating CPU, RAM, disk; pressure; recent OOM kills
+sudo server-setup rescue freeze       # PAUSE every app and container at once (nothing is killed)
+sudo server-setup rescue thaw         # resume them
+sudo server-setup rescue free-space   # ballast + journal + apt cache + dangling Docker images + old /tmp files
+sudo server-setup rescue stop-apps    # stop every app service and container
+sudo server-setup rescue kill <pid>
+sudo server-setup rescue restore      # put the ballast back when it's fixed
+```
+
+`rescue` never waits for a lock and writes nothing, so it works on a full disk and while another run is stuck. It raises its own CPU and I/O priority.
+
+**Measured on a 2-CPU / 4 GB test server.** An admin SSH login that runs `sudo` + a command:
+
+| Situation (caused by an app in `apps.slice`) | Login time |
+|---|---|
+| idle | 2.0 s |
+| 8 CPU hogs on 2 CPUs (CPU pressure 85%) | 2.0 s |
+| 5 GB of memory wanted on 3.9 GB RAM (memory pressure up to 90%, swap 3.4 GB) | 2.1–2.9 s |
+| disk 100% full (including root's reserve) | 4.5 s, then 2.2 s |
+
+`rescue freeze` took the CPU hogs to 0% instantly. SSH, journald, Docker and the monitoring stack stayed up in every test.
 
 ## Tools (app role): opt-in
 
@@ -221,6 +254,31 @@ confirm                      Keep a pending SSH change now.
 5. ~~**fleet**: manage many servers from the hub~~ ✅
 
 ## Testing status
+
+**Real server (Ubuntu 24.04, 2 CPU / 4 GB, with internet):**
+- **Setup:** a full `setup` with tools (docker, node, python), local monitoring, auditd and Lynis. Then a **re-run**, which keeps every earlier answer.
+- **SSH:** the 10-minute rollback confirmed by a real admin login, on two ports. SSH is limited to one IP, with no open-to-all rule left.
+- **Docker firewall:** published ports filtered by host port. `-p 80:80` and `-p 443:80` are reachable, `-p 8080:80` is blocked and logged.
+- **Monitoring:**
+  - The agent's metrics, container metrics and server-setup's own facts arrive in VictoriaMetrics.
+  - Journal and container logs arrive in Loki.
+  - vmalert loaded its rules, and Grafana provisioned its dashboard.
+- **Pressure:** the CPU, memory and disk-full stress tests above.
+
+Bugs found on that server and fixed:
+- The Docker route rules let `8080→80` through.
+- The monitoring step failed on non-hub servers.
+- cAdvisor needs root.
+- Docker's config wasn't refreshed on a re-run.
+
+Still to test on a server:
+- **Internal mode:** outbound blocked except to Nexus. It needs Nexus apt repos, which don't exist under the default names yet.
+- Debian 12 and Ubuntu 22.04.
+- The **dokploy-node** role, with a real Dokploy panel.
+- **fleet** between two servers.
+- The **hub** monitoring mode, with agents joining it.
+
+Also tested locally:
 
 Everything that can run without root was tested on Ubuntu 24.04:
 - **Sources:** direct apt works, and OS vs third-party sources are told apart. Checks ran against the real Nexus (it answers 401 or 404 for each repo).

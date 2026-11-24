@@ -21,7 +21,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="0.5.2"
+readonly SCRIPT_VERSION="0.6.0"
 readonly INSTALL_PATH="/usr/local/sbin/server-setup"
 readonly LIB_DIR="/usr/local/lib/server-setup"
 readonly STATE_DIR="/etc/server-setup"
@@ -1659,7 +1659,8 @@ render_daemon_json() { # render_daemon_json [swarm:y|n]
   if [[ $(route_of dockerhub) == mirror ]]; then mirrors=$(printf '  "registry-mirrors": ["https://%s"],\n' "$MIRROR_DOCKER_REGISTRY"); fi
   cat <<EOF
 {
-${mirrors}  "log-driver": "local",
+${mirrors}  "cgroup-parent": "apps.slice",
+  "log-driver": "local",
   "log-opts": { "max-size": "20m", "max-file": "5" },
   $([[ ${1:-n} == y ]] && echo '"live-restore": false' || echo '"live-restore": true'),
   "userland-proxy": false,
@@ -2023,6 +2024,7 @@ Wants=network-online.target
 StartLimitIntervalSec=0
 
 [Service]
+Slice=apps.slice
 User=$1
 Group=$1
 WorkingDirectory=$3
@@ -2323,6 +2325,7 @@ services:
     volumes: ["vmdata:/storage"]
     ports: ["127.0.0.1:8428:8428"]
     restart: unless-stopped
+    cgroup_parent: monitoring.slice
   vmalert:
     image: $IMG_VMALERT
     command: ["-rule=/etc/alerts/*.yml", "-datasource.url=http://victoriametrics:8428", "-notifier.url=http://alertmanager:9093",
@@ -2330,18 +2333,21 @@ services:
     volumes: ["./alerts:/etc/alerts:ro"]
     depends_on: [victoriametrics, alertmanager]
     restart: unless-stopped
+    cgroup_parent: monitoring.slice
   alertmanager:
     image: $IMG_ALERTMANAGER
     command: ["--config.file=/etc/alertmanager/alertmanager.yml", "--storage.path=/alertmanager"]
     volumes: ["./alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro", "amdata:/alertmanager"]
     ports: ["127.0.0.1:9093:9093"]
     restart: unless-stopped
+    cgroup_parent: monitoring.slice
   loki:
     image: $IMG_LOKI
     command: ["-config.file=/etc/loki/loki.yaml"]
     volumes: ["./loki.yaml:/etc/loki/loki.yaml:ro", "lokidata:/loki"]
     ports: ["127.0.0.1:3100:3100"]
     restart: unless-stopped
+    cgroup_parent: monitoring.slice
   grafana:
     image: $IMG_GRAFANA
     env_file: [./grafana.env]
@@ -2349,11 +2355,13 @@ services:
     ports: ["$([[ ${GRAFANA_PUBLIC:-n} == y ]] && echo '' || echo '127.0.0.1:')3000:3000"]
     depends_on: [victoriametrics, loki]
     restart: unless-stopped
+    cgroup_parent: monitoring.slice
   uptime-kuma:
     image: $IMG_KUMA
     volumes: ["kumadata:/app/data"]
     ports: ["127.0.0.1:3001:3001"]
     restart: unless-stopped
+    cgroup_parent: monitoring.slice
 EOF
   if [[ $hub == y ]]; then cat <<EOF
   gateway:
@@ -2362,6 +2370,7 @@ EOF
     ports: ["$HUB_PORT:$HUB_PORT"]
     depends_on: [victoriametrics, loki]
     restart: unless-stopped
+    cgroup_parent: monitoring.slice
 EOF
   fi
   cat <<EOF
@@ -3111,6 +3120,198 @@ cmd_fleet() {
 }
 
 # ----------------------------------------------------------------------------
+# Under pressure: the admin can always get in and fix it
+#   apps.slice        every workload: app-* services and every Docker container (cgroup-parent)
+#                     - memory capped below the RAM (MemoryHigh, then MemoryMax), low CPU/IO weight
+#   monitoring.slice  the monitoring stack - keeps reporting while apps misbehave
+#   ssh + user.slice  sshd and admin sessions: 10x the CPU/IO weight, memory protected (MemoryMin)
+#   systemd-oomd      kills the heaviest thing in apps.slice when it thrashes or swap runs out -
+#                     never sshd, admin sessions or system services
+#   ballast file      disk space held in reserve: `server-setup rescue free-space` frees it at once
+#   rescue            diagnose / freeze / thaw / stop-apps / free-space / kill
+# ----------------------------------------------------------------------------
+readonly BALLAST="/var/lib/server-setup/ballast"
+
+pressure_reserve_mb() { # memory kept free for the system and the admin: 5% of RAM, 256 MB..1 GB
+  local mb; mb=$(awk '/^MemTotal:/ {print int($2 / 1024 / 20)}' /proc/meminfo)
+  (( mb < 256 )) && mb=256; (( mb > 1024 )) && mb=1024
+  printf '%s' "$mb"
+}
+
+render_apps_slice() {
+  local total reserve high max
+  total=$(awk '/^MemTotal:/ {print int($2 / 1024)}' /proc/meminfo)
+  reserve=$(pressure_reserve_mb)
+  max=$(( total - reserve )); high=$(( total - 2 * reserve ))
+  cat <<EOF
+# Managed by server-setup: every workload (app-* services, Docker containers) lives here.
+# Above MemoryHigh it is slowed down and reclaimed; it can never take the last ${reserve} MB
+# of RAM (MemoryMax), which stay for sshd, the admin and the system.
+[Unit]
+Description=Applications (server-setup: capped so the server stays manageable)
+Before=slices.target
+
+[Slice]
+MemoryHigh=${high}M
+MemoryMax=${max}M
+CPUWeight=100
+IOWeight=100
+TasksMax=16384
+ManagedOOMMemoryPressure=kill
+ManagedOOMMemoryPressureLimit=80%
+ManagedOOMSwap=kill
+EOF
+}
+
+apply_pressure_guard() {
+  local reserve mf
+  reserve=$(pressure_reserve_mb)
+  render_apps_slice >/etc/systemd/system/apps.slice
+  cat >/etc/systemd/system/monitoring.slice <<'EOF'
+# Managed by server-setup: the monitoring stack - apart from the apps, so it keeps reporting
+[Unit]
+Description=Monitoring (server-setup)
+Before=slices.target
+
+[Slice]
+CPUWeight=200
+IOWeight=200
+MemoryMin=256M
+EOF
+  # sshd and every login session: far ahead of the apps for CPU and disk, memory protected
+  install -d /etc/systemd/system/ssh.service.d /etc/systemd/system/user.slice.d
+  cat >/etc/systemd/system/ssh.service.d/91-server-setup-pressure.conf <<'EOF'
+# Managed by server-setup: SSH answers even when the apps use every CPU and disk
+[Service]
+CPUWeight=1000
+IOWeight=1000
+MemoryMin=64M
+EOF
+  cat >/etc/systemd/system/user.slice.d/91-server-setup-pressure.conf <<'EOF'
+# Managed by server-setup: admin sessions (SSH logins) stay usable under load
+[Slice]
+CPUWeight=1000
+IOWeight=1000
+MemoryMin=256M
+EOF
+  # the kernel keeps this much RAM free for urgent allocations (1% of RAM, 64..256 MB)
+  mf=$(awk '/^MemTotal:/ {v = int($2 / 100); if (v < 65536) v = 65536; if (v > 262144) v = 262144; print v}' /proc/meminfo)
+  printf '# Managed by server-setup: headroom for urgent allocations under memory pressure\nvm.min_free_kbytes = %s\n' "$mf" \
+    >/etc/sysctl.d/94-server-setup-pressure.conf
+  sysctl -q -p /etc/sysctl.d/94-server-setup-pressure.conf >>"$LOG_FILE" 2>&1 || true
+  # systemd-oomd acts on apps.slice only (the slice's ManagedOOM* settings above)
+  if ! command -v oomctl >/dev/null && pkg_available systemd-oomd; then os_install systemd-oomd; fi
+  if command -v oomctl >/dev/null; then
+    install -d /etc/systemd/oomd.conf.d
+    printf '# Managed by server-setup\n[OOM]\nSwapUsedLimit=90%%\nDefaultMemoryPressureDurationSec=20s\n' >/etc/systemd/oomd.conf.d/90-server-setup.conf
+    systemctl enable systemd-oomd >>"$LOG_FILE" 2>&1 || true
+  fi
+  systemctl daemon-reload
+  systemctl start apps.slice monitoring.slice >>"$LOG_FILE" 2>&1 || true
+  if command -v oomctl >/dev/null; then systemctl restart systemd-oomd >>"$LOG_FILE" 2>&1 || true; fi
+  ballast_ensure
+  # Docker's containers belong in apps.slice too (cgroup-parent) - also on a re-run, when Docker
+  # was installed earlier. live-restore keeps running containers up; they move when re-created.
+  if os_installed docker-ce; then
+    render_daemon_json "$(docker_swarm_active && echo y || echo n)" >/etc/docker/daemon.json.new
+    if ! cmp -s /etc/docker/daemon.json.new /etc/docker/daemon.json; then
+      mv -f /etc/docker/daemon.json.new /etc/docker/daemon.json; systemctl restart docker
+      note "Docker: new containers start in apps.slice (running ones move there when they are re-created)."
+    else rm -f /etc/docker/daemon.json.new; fi
+  fi
+  note "Under pressure: apps (services + containers) capped at RAM - ${reserve} MB in apps.slice, slowed from RAM - $((2 * reserve)) MB;"
+  note "  SSH and admin sessions get 10x their CPU/disk priority and protected memory; systemd-oomd ends a"
+  note "  thrashing app, never SSH. Ballast $(ballast_size_mb) MB in $BALLAST. When it's bad: sudo server-setup rescue"
+}
+
+ballast_size_mb() { # 2% of the root filesystem, 256 MB..2 GB
+  df -Pm / | awk 'NR == 2 {v = int($2 / 50); if (v < 256) v = 256; if (v > 2048) v = 2048; print v}'
+}
+ballast_ensure() {
+  local want avail
+  want=$(ballast_size_mb)
+  [[ -f $BALLAST && $(stat -c %s "$BALLAST") -ge $(( want * 1048576 )) ]] && return 0
+  avail=$(df -Pm / | awk 'NR == 2 {print $4}')
+  if (( avail < want * 4 )); then warn "Not enough free disk to keep a ${want} MB ballast file now - skipped."; return 0; fi
+  install -d -m 700 "${BALLAST%/*}"
+  fallocate -l "${want}M" "$BALLAST" 2>/dev/null || dd if=/dev/zero of="$BALLAST" bs=1M count="$want" status=none
+  chmod 600 "$BALLAST"
+}
+
+# ---- rescue ------------------------------------------------------------------
+psi() { [[ -r /proc/pressure/$1 ]] && awk -v r="$1" '/^some/ {split($2, a, "="); printf "%s %s%% ", r, a[2]}' "/proc/pressure/$1"; }
+
+rescue_diagnose() {
+  local apps_mem
+  step "Pressure (share of time something waited, last 10 s)"
+  info "$(psi cpu)$(psi memory)$(psi io)  load $(cut -d' ' -f1-3 /proc/loadavg) on $(nproc) CPU"
+  free -m | awk '/^Mem:/ {printf "    RAM  %d MB used of %d MB, %d MB available\n", $3, $2, $7} /^Swap:/ {printf "    swap %d MB used of %d MB\n", $3, $2}'
+  apps_mem=$(systemctl show apps.slice -p MemoryCurrent --value 2>/dev/null)
+  [[ $apps_mem =~ ^[0-9]+$ ]] && info "apps.slice uses $(( apps_mem / 1048576 )) MB (limit $(systemctl show apps.slice -p MemoryMax --value | awk '{printf "%d", $1 / 1048576}') MB)$([[ $(systemctl show apps.slice -p FreezerState --value 2>/dev/null) == frozen ]] && echo ' - FROZEN')"
+  step "Top memory"
+  ps -eo pid,user,rss,comm --sort=-rss --no-headers | head -6 | awk '{printf "    %-8s %-12s %7d MB  %s\n", $1, $2, $3 / 1024, $4}'
+  step "Top CPU (now)"
+  top -b -n 2 -d 1 -o %CPU -w 120 2>/dev/null | awk '/^top - / {n++} n == 2 && /^ *PID / {p = 1; next} p && c++ < 6 {printf "    %-8s %-12s %5s%%  %s\n", $1, $2, $9, $12}'
+  step "Disks"
+  df -h -x tmpfs -x devtmpfs -x overlay -x squashfs | awk 'NR > 1 {printf "    %-22s %5s used of %5s (%s)\n", $6, $3, $2, $5}'
+  df -i / | awk 'NR == 2 {printf "    inodes on /: %s used\n", $5}'
+  [[ -f $BALLAST ]] && info "ballast: $(( $(stat -c %s "$BALLAST") / 1048576 )) MB ready to free (server-setup rescue free-space)"
+  info "biggest under /var: $(timeout 20 du -xsh /var/* 2>/dev/null | sort -rh | head -4 | awk '{printf "%s %s, ", $2, $1}')"
+  step "Recent out-of-memory kills"
+  journalctl -k --since -6h --no-pager -q 2>/dev/null | grep -E 'Out of memory|oom-kill|Killed process' | tail -3 | cut -c1-150 | sed 's/^/    /'
+  journalctl -u systemd-oomd --since -6h --no-pager -q 2>/dev/null | grep -i 'killed' | tail -3 | cut -c1-150 | sed 's/^/    /'
+  info "Actions: rescue freeze | thaw | stop-apps | free-space | kill <pid>"
+}
+
+rescue_free_space() {
+  local before after
+  before=$(df -Pm / | awk 'NR == 2 {print $4}')
+  if [[ -f $BALLAST ]]; then rm -f "$BALLAST"; ok "Ballast freed."; fi
+  journalctl --vacuum-size=200M >>"$LOG_FILE" 2>&1 || true
+  apt-get clean >>"$LOG_FILE" 2>&1 || true
+  if command -v docker >/dev/null; then
+    # dangling images and build cache only - never volumes or images in use
+    timeout 120 docker image prune -f >>"$LOG_FILE" 2>&1 || true
+    timeout 120 docker builder prune -f >>"$LOG_FILE" 2>&1 || true
+  fi
+  find /tmp /var/tmp -xdev -type f -atime +7 -delete 2>/dev/null || true
+  after=$(df -Pm / | awk 'NR == 2 {print $4}')
+  ok "Freed $(( after - before )) MB on / (now $after MB free). Find the cause: sudo server-setup rescue"
+  info "When it's fixed, re-create the ballast: sudo server-setup rescue restore"
+}
+
+cmd_rescue() {
+  local action=${1-}; if (( $# > 0 )); then shift; fi
+  # the rescue itself goes ahead of everything else
+  renice -n -15 -p $$ >/dev/null 2>&1 || true
+  ionice -c 1 -n 0 -p $$ >/dev/null 2>&1 || true
+  case $action in
+    ""|diagnose) rescue_diagnose ;;
+    freeze)
+      systemctl freeze apps.slice || die "Could not freeze apps.slice (needs cgroup v2 and systemd 246+)."
+      ok "All apps and containers are PAUSED (nothing killed). Look around: sudo server-setup rescue   Resume: sudo server-setup rescue thaw" ;;
+    thaw) systemctl thaw apps.slice; ok "Apps resumed." ;;
+    stop-apps)
+      need_tty
+      local go; prompt_yn go "Stop every app service and every Docker container now?" n
+      [[ $go == y ]] || exit 0
+      systemctl thaw apps.slice 2>/dev/null || true
+      systemctl stop 'app-*.service' 2>/dev/null || true
+      if command -v docker >/dev/null; then timeout 120 docker ps -q | xargs -r timeout 120 docker stop -t 10 >/dev/null || true; fi
+      ok "Apps stopped. Start them again: systemctl start app-<name> / docker start <container>" ;;
+    free-space) rescue_free_space ;;
+    restore) ballast_ensure; systemctl thaw apps.slice 2>/dev/null || true; ok "Ballast back, apps not frozen." ;;
+    kill)
+      local pid=${1-}
+      [[ $pid =~ ^[0-9]+$ ]] || die "usage: server-setup rescue kill <pid>   (see: server-setup rescue)"
+      [[ $(ps -o comm= -p "$pid") != sshd ]] || die "That is sshd - not killed."
+      kill -TERM "$pid"; sleep 3; kill -0 "$pid" 2>/dev/null && kill -KILL "$pid"
+      ok "Process $pid ended." ;;
+    *) die "usage: server-setup rescue [diagnose] | freeze | thaw | stop-apps | free-space | restore | kill <pid>" ;;
+  esac
+}
+
+# ----------------------------------------------------------------------------
 # Setup
 # ----------------------------------------------------------------------------
 collect_answers() {
@@ -3141,7 +3342,8 @@ collect_answers() {
   prompt OPEN_PORTS "Ports open to everyone (e.g. 80 443; empty = none)" "${OPEN_PORTS:-}" valid_open_ports
   UFW_RESET=n
   allowed=$(printf '%s|' $SSH_PORTS 22); allowed=${allowed%|}
-  rules=$(ufw show added 2>/dev/null | grep '^ufw ' | grep -vE "allow ($allowed)/tcp" || true)
+  # rules this script made carry its comments ('SSH', 'server-setup ...') - only others count
+  rules=$(ufw show added 2>/dev/null | grep '^ufw ' | grep -vE "allow ($allowed)/tcp" | grep -vE "comment '(SSH|server-setup|swarm|monitoring)" || true)
   if [[ -n $rules ]]; then
     warn "The firewall already has other rules:"; printf '        %s\n' "$rules" >&2
     prompt_yn UFW_RESET "Remove them and keep only what this setup manages?" n
@@ -3244,6 +3446,7 @@ cmd_setup() {
   try_step "fail2ban" step_fail2ban
   try_step "Kernel and system hardening" apply_hardening
   try_step "Long-uptime tuning (limits, network, swap, zswap)" apply_uptime_tuning
+  try_step "Staying reachable under pressure (app slice, protected SSH, OOM guard, ballast)" apply_pressure_guard
   try_step "Logs (journal, logrotate)" apply_logs
   try_step "Automatic security updates" apply_auto_updates
   if [[ -n $PRO_TOKEN ]]; then try_step "Ubuntu Pro and Livepatch" apply_ubuntu_pro; fi
@@ -3371,6 +3574,7 @@ cmd_status() {
   info "$(hostname -f 2>/dev/null || hostname) - $OS_ID $OS_VERSION, kernel $(uname -r), up $(uptime -p | sed 's/^up //')"
   info "load $(cut -d' ' -f1-3 /proc/loadavg) on $(nproc) CPU; $(free -h | awk '/^Mem:/ {print "RAM " $3 " used of " $2} /^Swap:/ {print ", swap " $3 " of " $2}' | xargs)"
   df -h -x tmpfs -x devtmpfs -x overlay -x squashfs 2>/dev/null | awk 'NR > 1 {printf "    disk %-20s %5s used of %5s (%s)\n", $6, $3, $2, $5}'
+  info "pressure (10 s): $(psi cpu)$(psi memory)$(psi io)$([[ $(systemctl show apps.slice -p FreezerState --value 2>/dev/null) == frozen ]] && echo ' - APPS FROZEN (rescue thaw)')"
   why=$(os_reboot_reason); if [[ -n $why ]]; then warn "Reboot needed: $why"; else ok "No reboot needed."; fi
   failed=$(systemctl --failed --plain --no-legend 2>/dev/null | awk '{print $1}' | xargs)
   if [[ -n $failed ]]; then warn "Failed services: $failed"; else ok "No failed services."; fi
@@ -3498,6 +3702,12 @@ server-setup $SCRIPT_VERSION - hardened Ubuntu/Debian servers, online or interna
                                for many servers, or an existing one (external). move-to: a
                                single server grows into a hub setup, with its history.
 
+  rescue [diagnose] | freeze | thaw | stop-apps | free-space | restore | kill <pid>
+                               When the server is under pressure (full disk, RAM or CPU): what is
+                               eating it; pause every app at once (freeze, nothing killed) to get
+                               control back; free the disk ballast + caches; stop or kill apps.
+                               SSH and admin sessions keep priority all the time (apps.slice).
+
   ssh [--ports "22 9011"]      Re-apply the SSH hardening or change its ports (auto-rollback).
   confirm                      Keep a pending SSH change now (otherwise it is kept on the
                                admin's first login, or rolled back after $ROLLBACK_MINUTES minutes).
@@ -3531,6 +3741,7 @@ main() {
   case $cmd in
     fleet-agent) cmd_fleet_agent; return 0 ;;
     status) cmd_status; return 0 ;;
+    rescue) cmd_rescue "$@"; return 0 ;;
   esac
   case $cmd in
     *)
