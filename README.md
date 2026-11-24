@@ -2,7 +2,7 @@
 
 Turn a fresh **Ubuntu or Debian** server into a **hardened server that runs for years**: production backends, Dokploy nodes and monitoring hubs. It works with normal internet access or inside an **internal network** where only a mirror is reachable, and it keeps managing the server afterwards.
 
-> **Status: phase 2 of 5.** The *base* role (hardening, users, SSH, firewall, long-uptime tuning, download sources) and the *app* role (opt-in tools, app services, backups) are implemented. *monitor*, *dokploy-node* and *fleet* come next.
+> **Status: phase 3 of 5.** Implemented: the *base* role (hardening, users, SSH, firewall, long-uptime tuning, download sources), the *app* role (opt-in tools, app services, backups) and *monitor* (agent + stack, single server to hub). *dokploy-node* and *fleet* come next.
 
 | | |
 |---|---|
@@ -104,6 +104,42 @@ sudo server-setup tools install apt:jq url:https://github.com/org/tool/releases/
 
 **Backups:** `server-setup backup init` sets up daily restic backups to a local disk, SFTP or S3/MinIO, with a retention policy and a 1% data check after each run. The restic password goes to the credentials file. Keep it outside the server too.
 
+## Monitoring: from one server to many
+
+Every monitored server runs **Grafana Alloy**, one agent that collects:
+- host metrics, including the state of every systemd service
+- container metrics and container logs
+- the system journal
+- server-setup's own facts: reboot needed, security updates waiting
+
+It **pushes** everything, so it works through NAT and firewalls. The **stack** is VictoriaMetrics, Loki, Grafana with a ready dashboard, vmalert + Alertmanager with 12 alert rules, and Uptime Kuma. It runs with docker compose in `/opt/server-setup/monitoring`, with images pulled directly or through the mirror.
+
+| Mode | Use it when |
+|---|---|
+| `local` | one server (a startup): the stack runs right here |
+| `hub` | this server watches many: the others `join` it over TLS with a login (port 8430) |
+| `external` | you already run Prometheus-compatible storage + Loki: only the agent |
+| `none` | no monitoring |
+
+```bash
+sudo server-setup monitor setup                           # choose the mode, retention, alert receivers
+sudo server-setup monitor token                           # on the hub: the agents' login
+sudo server-setup monitor join https://hub.example:8430   # on every other server
+sudo server-setup monitor move-to https://hub:8430        # a 'local' server grows: agent re-pointed, metric history copied
+```
+
+**Alerts:**
+- server silent
+- disk almost full / fills within 24 h
+- low memory, swap almost full, OOM kill
+- high load
+- failed service
+- clock not synced
+- reboot needed for a day, security updates waiting 2 days
+- a container restarting
+
+They go to Telegram (needs internet), e-mail (SMTP) and/or a webhook. Grafana and Uptime Kuma listen on localhost only, reached through SSH: `ssh -L 3000:127.0.0.1:3000 <server>`. Nothing reports usage to Grafana Labs, and Grafana doesn't preinstall plugins from the internet.
+
 ## Commands
 
 ```text
@@ -118,6 +154,7 @@ mirror show|test|set|recheck
 tools list | install <tool>... [--version V] [--prefix DIR] [--sha256 H] | remove <tool>...
 apps list | add <name> --exec CMD [--port N] | remove <name>
 backup init|run|status|list
+monitor status|setup|apply|join <hub>|move-to <hub>|token|alerts
 ssh [--ports "22 9011"]      Re-apply SSH hardening / change ports (auto-rollback).
 confirm                      Keep a pending SSH change now.
 ```
@@ -137,6 +174,6 @@ confirm                      Keep a pending SSH change now.
 
 1. ~~Framework, download sources, base role~~ ✅
 2. ~~**app**: opt-in tools catalog, app services, restic backups~~ ✅
-3. **monitor**: Grafana Alloy agent on every server. The stack (VictoriaMetrics, Loki, Grafana, Alertmanager, Uptime Kuma) can run on the same server or on a hub, or the agent can feed one you already have. `monitor move-to <hub>` when you outgrow one server.
+3. ~~**monitor**: Alloy agent; local / hub / external stack; move-to~~ ✅
 4. **dokploy-node**: prepares a server to be managed by a remote Dokploy panel, with all of Dokploy's setup steps done ahead of time so "Setup Server" works without internet.
 5. **fleet**: manage many servers from the hub.

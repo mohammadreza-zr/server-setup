@@ -21,7 +21,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="0.2.0"
+readonly SCRIPT_VERSION="0.3.0"
 readonly INSTALL_PATH="/usr/local/sbin/server-setup"
 readonly LIB_DIR="/usr/local/lib/server-setup"
 readonly STATE_DIR="/etc/server-setup"
@@ -65,6 +65,11 @@ REPO_DOCKER_APT="" REPO_GRAFANA_APT="" REPO_NODESOURCE_APT="" MIRROR_DOCKER_REGI
 REPO_NPM="" REPO_PYPI="" REPO_GO="" REPO_GODL="" REPO_GITHUB=""
 # Tools (app role) and backups
 TOOLS="" NODE_MAJOR="" BACKUP_REPO="" BACKUP_PATHS="" BACKUP_TIME="" BACKUP_KEEP=""
+# Monitoring (monitor role)
+MONITOR="" MONITOR_RETENTION="" LOG_RETENTION="" MONITOR_USER="" MONITOR_METRICS_URL="" MONITOR_LOGS_URL=""
+MONITOR_HUB_ADDR="" MONITOR_ALLOW="" MONITOR_INSECURE_TLS="" GRAFANA_PUBLIC=""
+ALERT_TELEGRAM_CHAT="" ALERT_EMAIL_TO="" ALERT_EMAIL_FROM="" ALERT_SMTP="" ALERT_SMTP_USER="" ALERT_WEBHOOK=""
+IMG_VM="" IMG_VMALERT="" IMG_LOKI="" IMG_GRAFANA="" IMG_ALERTMANAGER="" IMG_KUMA="" IMG_CADDY=""
 # Per source: SRC_<name> = auto|direct|mirror|none (what the admin wants),
 #             ROUTE_<name> = direct|mirror|none (what is in use now)
 readonly SOURCES="apt ntp dockerhub ghcr dockerapt grafanaapt nodesource npm pypi go godl github"
@@ -77,7 +82,10 @@ CONF_KEYS="ADMIN_USER DEPLOY_USER SSH_PORTS SSH_ALLOW TRUSTED_IPS OPEN_PORTS AUT
   TIMEZONE NTP_SERVERS JOURNAL_MAX AUDITD LYNIS ROLES SETUP_DONE MIRROR_URL MIRROR_USER
   REPO_UBUNTU REPO_UBUNTU_SECURITY REPO_UBUNTU_PORTS REPO_DEBIAN REPO_DEBIAN_SECURITY
   REPO_DOCKER_APT REPO_GRAFANA_APT REPO_NODESOURCE_APT MIRROR_DOCKER_REGISTRY
-  REPO_NPM REPO_PYPI REPO_GO REPO_GODL REPO_GITHUB TOOLS NODE_MAJOR BACKUP_REPO BACKUP_PATHS BACKUP_TIME BACKUP_KEEP"
+  REPO_NPM REPO_PYPI REPO_GO REPO_GODL REPO_GITHUB TOOLS NODE_MAJOR BACKUP_REPO BACKUP_PATHS BACKUP_TIME BACKUP_KEEP
+  MONITOR MONITOR_RETENTION LOG_RETENTION MONITOR_USER MONITOR_METRICS_URL MONITOR_LOGS_URL MONITOR_HUB_ADDR
+  MONITOR_ALLOW MONITOR_INSECURE_TLS GRAFANA_PUBLIC ALERT_TELEGRAM_CHAT ALERT_EMAIL_TO ALERT_EMAIL_FROM ALERT_SMTP
+  ALERT_SMTP_USER ALERT_WEBHOOK IMG_VM IMG_VMALERT IMG_LOKI IMG_GRAFANA IMG_ALERTMANAGER IMG_KUMA IMG_CADDY"
 for _s in $SOURCES; do CONF_KEYS+=" SRC_$_s ROUTE_$_s"; done; unset _s
 
 # Answers of this run that are not saved
@@ -100,6 +108,7 @@ defaults() { # fill every setting that is still empty
   [[ -n $MIRROR_DOCKER_REGISTRY ]] || MIRROR_DOCKER_REGISTRY=$(mirror_host)
   local s v
   for s in $SOURCES; do v="SRC_$s"; [[ -n ${!v} ]] || printf -v "$v" auto; done
+  mon_defaults
 }
 # Output
 # ----------------------------------------------------------------------------
@@ -2040,6 +2049,691 @@ cmd_apps() {
 }
 
 # ----------------------------------------------------------------------------
+# Monitoring (monitor role). One design for every size:
+#   agent  - Grafana Alloy on every server: host + container metrics, journal + container
+#            logs, pushed (remote_write / Loki push) - works through NAT and firewalls.
+#   none     no monitoring
+#   external the agent pushes to a Prometheus-compatible + Loki you already run
+#   local    the whole stack on this server (a startup's single server)
+#   hub      the stack here, and other servers push to it (server-setup monitor join)
+#   Stack: VictoriaMetrics, Loki, Grafana, vmalert + Alertmanager, Uptime Kuma (compose).
+#   Grow: server-setup monitor move-to <hub> - re-points the agent and copies the history.
+# ----------------------------------------------------------------------------
+readonly MON_DIR="/opt/server-setup/monitoring"
+readonly TEXTFILE_DIR="/var/lib/server-setup/textfile"
+readonly HUB_PORT=8430
+
+mon_defaults() {
+  : "${MONITOR:=none}" "${MONITOR_RETENTION:=90d}" "${LOG_RETENTION:=30d}" "${MONITOR_USER:=agent}"
+  : "${IMG_VM:=victoriametrics/victoria-metrics:v1.157.0}" "${IMG_VMALERT:=victoriametrics/vmalert:v1.157.0}"
+  : "${IMG_LOKI:=grafana/loki:3.7.10}"
+  : "${IMG_GRAFANA:=grafana/grafana:13.3.1}" "${IMG_ALERTMANAGER:=prom/alertmanager:v0.35.0}"
+  : "${IMG_KUMA:=louislam/uptime-kuma:2.5.12}" "${IMG_CADDY:=caddy:2.11.9}"
+}
+mon_stack_here() { [[ $MONITOR == local || $MONITOR == hub ]]; }
+mon_metrics_url() {
+  case $MONITOR in
+    local|hub) printf 'http://127.0.0.1:8428/api/v1/write' ;;
+    external) printf '%s' "$MONITOR_METRICS_URL" ;;
+  esac
+}
+mon_logs_url() {
+  case $MONITOR in
+    local|hub) printf 'http://127.0.0.1:3100/loki/api/v1/push' ;;
+    external) printf '%s' "$MONITOR_LOGS_URL" ;;
+  esac
+}
+
+# ---- the agent -------------------------------------------------------------
+render_alloy() { # render_alloy <docker:y|n> <auth:y|n> <insecure-tls:y|n>
+  local host docker=$1 auth=$2 insecure=$3 ba="" tls=""
+  host=$(hostname -s)
+  if [[ $auth == y ]]; then ba=$(printf '    basic_auth {\n      username      = "%s"\n      password_file = "/etc/alloy/monitor-password"\n    }\n' "$MONITOR_USER"); fi
+  # a hub's own certificate (Caddy's internal CA): encrypted, but not verified against a public CA
+  if [[ $insecure == y ]]; then tls=$(printf '    tls_config {\n      insecure_skip_verify = true\n    }\n'); fi
+  cat <<EOF
+// Managed by server-setup - rewritten by: server-setup monitor apply
+logging {
+  level = "warn"
+}
+
+// ---- host metrics (node exporter) + server-setup's own facts (reboot needed, updates)
+prometheus.exporter.unix "host" {
+  enable_collectors = ["systemd"]
+  textfile {
+    directory = "$TEXTFILE_DIR"
+  }
+}
+
+prometheus.scrape "host" {
+  targets         = prometheus.exporter.unix.host.targets
+  forward_to      = [prometheus.relabel.instance.receiver]
+  job_name        = "node"
+  scrape_interval = "30s"
+}
+EOF
+  if [[ $docker == y ]]; then cat <<EOF
+
+// ---- container metrics (cAdvisor) and container logs
+prometheus.exporter.cadvisor "containers" {
+  docker_host      = "unix:///var/run/docker.sock"
+  docker_only      = true
+  storage_duration = "5m"
+}
+
+prometheus.scrape "containers" {
+  targets         = prometheus.exporter.cadvisor.containers.targets
+  forward_to      = [prometheus.relabel.instance.receiver]
+  job_name        = "containers"
+  scrape_interval = "30s"
+}
+
+discovery.docker "containers" {
+  host = "unix:///var/run/docker.sock"
+}
+
+discovery.relabel "containers" {
+  targets = discovery.docker.containers.targets
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+}
+
+loki.source.docker "containers" {
+  host       = "unix:///var/run/docker.sock"
+  targets    = discovery.relabel.containers.output
+  forward_to = [loki.write.out.receiver]
+  labels     = { host = "$host", job = "docker" }
+}
+EOF
+  fi
+  cat <<EOF
+
+// ---- every series carries this server's name
+prometheus.relabel "instance" {
+  forward_to = [prometheus.remote_write.out.receiver]
+  rule {
+    target_label = "instance"
+    replacement  = "$host"
+  }
+}
+
+prometheus.remote_write "out" {
+  endpoint {
+    url = "$(mon_metrics_url)"
+$ba
+$tls
+  }
+}
+
+// ---- system journal
+loki.relabel "journal" {
+  forward_to = []
+  rule {
+    source_labels = ["__journal__systemd_unit"]
+    target_label  = "unit"
+  }
+  rule {
+    source_labels = ["__journal_priority_keyword"]
+    target_label  = "level"
+  }
+}
+
+loki.source.journal "journal" {
+  forward_to    = [loki.write.out.receiver]
+  relabel_rules = loki.relabel.journal.rules
+  labels        = { host = "$host", job = "journal" }
+  max_age       = "12h"
+}
+
+loki.write "out" {
+  endpoint {
+    url = "$(mon_logs_url)"
+$ba
+$tls
+  }
+}
+EOF
+}
+
+render_textfile_script() {
+  cat <<EOF
+#!/bin/bash
+# Managed by server-setup: facts for the monitoring agent (every 15 min)
+set -u
+out=$TEXTFILE_DIR/server_setup.prom
+reboot=0
+if [[ -f /var/run/reboot-required ]]; then reboot=1
+elif command -v needrestart >/dev/null && [[ \$(needrestart -b -k 2>/dev/null | awk -F': ' '/NEEDRESTART-KSTA/ {print \$2}') =~ ^[23]\$ ]]; then reboot=1; fi
+sec=\$(apt-get -s -o Debug::NoLocking=1 upgrade 2>/dev/null | grep -c '^Inst .*-security' || true)
+{
+  echo '# HELP server_setup_reboot_required 1 when the server needs a reboot to finish updates.'
+  echo '# TYPE server_setup_reboot_required gauge'
+  echo "server_setup_reboot_required \$reboot"
+  echo '# HELP server_setup_security_updates Security updates waiting to be installed.'
+  echo '# TYPE server_setup_security_updates gauge'
+  echo "server_setup_security_updates \${sec:-0}"
+} >"\$out.tmp" && mv -f "\$out.tmp" "\$out"
+EOF
+}
+
+install_agent() {
+  local docker=n auth=n insecure=n
+  apt_repo grafanaapt grafana https://apt.grafana.com stable main https://apt.grafana.com/gpg.key
+  os_install alloy
+  install -d -m 755 "$TEXTFILE_DIR"
+  render_textfile_script >"$LIB_DIR/textfile"; chmod 755 "$LIB_DIR/textfile"
+  cat >/etc/systemd/system/server-setup-textfile.service <<EOF
+# Managed by server-setup
+[Unit]
+Description=Facts for the monitoring agent (server-setup)
+[Service]
+Type=oneshot
+Nice=10
+ExecStart=$LIB_DIR/textfile
+EOF
+  cat >/etc/systemd/system/server-setup-textfile.timer <<'EOF'
+# Managed by server-setup
+[Unit]
+Description=Facts for the monitoring agent, every 15 minutes
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload; systemctl enable --now server-setup-textfile.timer >>"$LOG_FILE" 2>&1
+  "$LIB_DIR/textfile" || true
+  # what the agent may read: the journal; Docker's socket (= root on this host) only for containers
+  usermod -aG systemd-journal,adm alloy 2>/dev/null || true
+  if os_installed docker-ce; then docker=y; usermod -aG docker alloy; fi
+  local pw; pw=$(secret_get monitor-password || true)
+  # local/hub push to this server's own stack on 127.0.0.1 (no login); external may need one
+  if [[ $MONITOR == external && -n $pw && -n $MONITOR_USER ]]; then auth=y; fi
+  if [[ $auth == y ]]; then ( umask 077; printf '%s' "$pw" >/etc/alloy/monitor-password ); chown root:alloy /etc/alloy/monitor-password; chmod 640 /etc/alloy/monitor-password; fi
+  [[ ${MONITOR_INSECURE_TLS:-n} == y ]] && insecure=y
+  render_alloy "$docker" "$auth" "$insecure" >/etc/alloy/config.alloy
+  # no usage reporting to Grafana Labs
+  if [[ -f /etc/default/alloy ]] && ! grep -q 'disable-reporting' /etc/default/alloy; then
+    sed -i -E 's/^CUSTOM_ARGS="?([^"]*)"?/CUSTOM_ARGS="\1 --disable-reporting"/' /etc/default/alloy
+  fi
+  systemctl enable alloy >>"$LOG_FILE" 2>&1; systemctl restart alloy
+  sleep 3
+  systemctl is-active --quiet alloy || { journalctl -u alloy -n 20 --no-pager >&2; die "The monitoring agent (alloy) did not start - see above."; }
+  note "Monitoring agent: Grafana Alloy -> $(mon_metrics_url) (metrics) and $(mon_logs_url) (logs)$([[ $docker == y ]] && echo ', containers included')."
+  [[ $docker == y ]] && note "  The agent is in the docker group to read container stats and logs (that group is root-equivalent)."
+}
+
+# ---- the stack ---------------------------------------------------------------
+render_compose() { # render_compose <hub:y|n>
+  local hub=$1
+  cat <<EOF
+# Managed by server-setup - rewritten by: server-setup monitor apply
+name: monitoring
+services:
+  victoriametrics:
+    image: $IMG_VM
+    command: ["-storageDataPath=/storage", "-retentionPeriod=$MONITOR_RETENTION", "-httpListenAddr=:8428", "-selfScrapeInterval=30s"]
+    volumes: ["vmdata:/storage"]
+    ports: ["127.0.0.1:8428:8428"]
+    restart: unless-stopped
+  vmalert:
+    image: $IMG_VMALERT
+    command: ["-rule=/etc/alerts/*.yml", "-datasource.url=http://victoriametrics:8428", "-notifier.url=http://alertmanager:9093",
+              "-remoteWrite.url=http://victoriametrics:8428", "-remoteRead.url=http://victoriametrics:8428", "-evaluationInterval=1m"]
+    volumes: ["./alerts:/etc/alerts:ro"]
+    depends_on: [victoriametrics, alertmanager]
+    restart: unless-stopped
+  alertmanager:
+    image: $IMG_ALERTMANAGER
+    command: ["--config.file=/etc/alertmanager/alertmanager.yml", "--storage.path=/alertmanager"]
+    volumes: ["./alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro", "amdata:/alertmanager"]
+    ports: ["127.0.0.1:9093:9093"]
+    restart: unless-stopped
+  loki:
+    image: $IMG_LOKI
+    command: ["-config.file=/etc/loki/loki.yaml"]
+    volumes: ["./loki.yaml:/etc/loki/loki.yaml:ro", "lokidata:/loki"]
+    ports: ["127.0.0.1:3100:3100"]
+    restart: unless-stopped
+  grafana:
+    image: $IMG_GRAFANA
+    env_file: [./grafana.env]
+    volumes: ["grafanadata:/var/lib/grafana", "./grafana/provisioning:/etc/grafana/provisioning:ro", "./grafana/dashboards:/var/lib/grafana/dashboards:ro"]
+    ports: ["$([[ ${GRAFANA_PUBLIC:-n} == y ]] && echo '' || echo '127.0.0.1:')3000:3000"]
+    depends_on: [victoriametrics, loki]
+    restart: unless-stopped
+  uptime-kuma:
+    image: $IMG_KUMA
+    volumes: ["kumadata:/app/data"]
+    ports: ["127.0.0.1:3001:3001"]
+    restart: unless-stopped
+EOF
+  if [[ $hub == y ]]; then cat <<EOF
+  gateway:
+    image: $IMG_CADDY
+    volumes: ["./Caddyfile:/etc/caddy/Caddyfile:ro", "caddydata:/data"]
+    ports: ["$HUB_PORT:$HUB_PORT"]
+    depends_on: [victoriametrics, loki]
+    restart: unless-stopped
+EOF
+  fi
+  cat <<EOF
+volumes:
+  vmdata: {}
+  amdata: {}
+  lokidata: {}
+  grafanadata: {}
+  kumadata: {}
+$([[ $hub == y ]] && echo '  caddydata: {}')
+EOF
+}
+
+render_loki() {
+  cat <<EOF
+# Managed by server-setup
+auth_enabled: false
+server:
+  http_listen_port: 3100
+  log_level: warn
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+schema_config:
+  configs:
+    - from: 2024-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+limits_config:
+  retention_period: $LOG_RETENTION
+  reject_old_samples: true
+  reject_old_samples_max_age: 168h
+  ingestion_rate_mb: 16
+  ingestion_burst_size_mb: 32
+  allow_structured_metadata: true
+compactor:
+  working_directory: /loki/compactor
+  retention_enabled: true
+  delete_request_store: filesystem
+analytics:
+  reporting_enabled: false
+EOF
+}
+
+render_alert_rules() {
+  cat <<'EOF'
+# Managed by server-setup: alerts for every server that pushes to this stack
+groups:
+  - name: server-setup
+    rules:
+      - alert: ServerSilent
+        expr: lag(node_time_seconds[3d]) > 300
+        labels: { severity: critical }
+        annotations: { summary: "{{ $labels.instance }} has sent no metrics for {{ $value | humanizeDuration }} (down, or its agent stopped)" }
+      - alert: DiskAlmostFull
+        expr: 100 * node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs|ramfs"} / node_filesystem_size_bytes{fstype!~"tmpfs|overlay|squashfs|ramfs"} < 10
+        for: 10m
+        labels: { severity: critical }
+        annotations: { summary: "{{ $labels.instance }}: {{ $labels.mountpoint }} has only {{ $value | printf \"%.1f\" }}% free" }
+      - alert: DiskFillsIn24h
+        expr: predict_linear(node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs|ramfs"}[6h], 86400) < 0
+        for: 30m
+        labels: { severity: warning }
+        annotations: { summary: "{{ $labels.instance }}: {{ $labels.mountpoint }} will be full within a day at this rate" }
+      - alert: MemoryLow
+        expr: 100 * node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes < 10
+        for: 10m
+        labels: { severity: warning }
+        annotations: { summary: "{{ $labels.instance }}: only {{ $value | printf \"%.1f\" }}% memory available" }
+      - alert: SwapAlmostFull
+        expr: node_memory_SwapTotal_bytes > 0 and (1 - node_memory_SwapFree_bytes / node_memory_SwapTotal_bytes) > 0.8
+        for: 15m
+        labels: { severity: warning }
+        annotations: { summary: "{{ $labels.instance }}: swap is {{ $value | humanizePercentage }} full" }
+      - alert: OOMKill
+        expr: increase(node_vmstat_oom_kill[30m]) > 0
+        labels: { severity: warning }
+        annotations: { summary: "{{ $labels.instance }}: the kernel killed a process for lack of memory" }
+      - alert: HighLoad
+        expr: node_load15 / count by (instance) (node_cpu_seconds_total{mode="idle"}) > 2
+        for: 30m
+        labels: { severity: warning }
+        annotations: { summary: "{{ $labels.instance }}: load is {{ $value | printf \"%.1f\" }}x the CPU count for 30 min" }
+      - alert: ServiceFailed
+        expr: node_systemd_unit_state{state="failed"} == 1
+        for: 5m
+        labels: { severity: warning }
+        annotations: { summary: "{{ $labels.instance }}: {{ $labels.name }} has failed" }
+      - alert: ClockNotSynced
+        expr: node_timex_sync_status == 0 or abs(node_timex_offset_seconds) > 0.1
+        for: 30m
+        labels: { severity: warning }
+        annotations: { summary: "{{ $labels.instance }}: the clock is not synchronized" }
+      - alert: RebootNeeded
+        expr: server_setup_reboot_required == 1
+        for: 24h
+        labels: { severity: info }
+        annotations: { summary: "{{ $labels.instance }} needs a reboot to finish updates (for a day now)" }
+      - alert: SecurityUpdatesWaiting
+        expr: server_setup_security_updates > 0
+        for: 48h
+        labels: { severity: info }
+        annotations: { summary: "{{ $labels.instance }}: {{ $value }} security updates waiting for 2 days (server-setup update)" }
+      - alert: ContainerRestarting
+        expr: changes(container_start_time_seconds{name!=""}[30m]) > 3
+        labels: { severity: warning }
+        annotations: { summary: "{{ $labels.instance }}: container {{ $labels.name }} restarted more than 3 times in 30 min" }
+EOF
+}
+
+render_alertmanager() {
+  local pw
+  printf '# Managed by server-setup: where alerts go (server-setup monitor alerts)\n'
+  printf 'route:\n  receiver: default\n  group_by: [alertname, instance]\n  group_wait: 30s\n  group_interval: 5m\n  repeat_interval: 6h\n'
+  printf 'receivers:\n  - name: default\n'
+  if [[ -n ${ALERT_TELEGRAM_CHAT-} ]]; then
+    pw=$(secret_get telegram-token || true)
+    printf '    telegram_configs:\n      - bot_token: "%s"\n        chat_id: %s\n        send_resolved: true\n' "$pw" "$ALERT_TELEGRAM_CHAT"
+  fi
+  if [[ -n ${ALERT_EMAIL_TO-} ]]; then
+    pw=$(secret_get smtp-password || true)
+    printf '    email_configs:\n      - to: "%s"\n        from: "%s"\n        smarthost: "%s"\n        auth_username: "%s"\n        auth_password: "%s"\n        send_resolved: true\n' \
+      "$ALERT_EMAIL_TO" "$ALERT_EMAIL_FROM" "$ALERT_SMTP" "${ALERT_SMTP_USER-}" "$pw"
+  fi
+  if [[ -n ${ALERT_WEBHOOK-} ]]; then
+    printf '    webhook_configs:\n      - url: "%s"\n        send_resolved: true\n' "$ALERT_WEBHOOK"
+  fi
+}
+
+render_grafana_provisioning() { # writes the datasource and dashboard provisioning into <dir>
+  local d=$1
+  install -d -m 755 "$d/datasources" "$d/dashboards"
+  cat >"$d/datasources/server-setup.yaml" <<'EOF'
+apiVersion: 1
+datasources:
+  - name: VictoriaMetrics
+    uid: vm
+    type: prometheus
+    access: proxy
+    url: http://victoriametrics:8428
+    isDefault: true
+  - name: Loki
+    uid: loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+EOF
+  cat >"$d/dashboards/server-setup.yaml" <<'EOF'
+apiVersion: 1
+providers:
+  - name: server-setup
+    folder: server-setup
+    type: file
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards
+EOF
+}
+
+render_dashboard() { # one overview dashboard: every server, its containers and its logs
+  python3 -I - <<'PYEOF'
+import json
+def ts(title, expr, unit, x, y, w=12, h=8, legend="{{instance}}"):
+    return {"type": "timeseries", "title": title, "datasource": {"type": "prometheus", "uid": "vm"},
+            "gridPos": {"x": x, "y": y, "w": w, "h": h},
+            "fieldConfig": {"defaults": {"unit": unit}, "overrides": []},
+            "targets": [{"refId": "A", "expr": expr, "legendFormat": legend}]}
+def stat(title, expr, unit, x, y, w=4, h=4, thresholds=None):
+    p = {"type": "stat", "title": title, "datasource": {"type": "prometheus", "uid": "vm"},
+         "gridPos": {"x": x, "y": y, "w": w, "h": h},
+         "fieldConfig": {"defaults": {"unit": unit}, "overrides": []},
+         "targets": [{"refId": "A", "expr": expr, "legendFormat": "{{instance}}"}]}
+    if thresholds:
+        p["fieldConfig"]["defaults"]["thresholds"] = {"mode": "absolute", "steps": thresholds}
+    return p
+I = 'instance=~"$instance"'
+panels = [
+  stat("Up for", f'time() - node_boot_time_seconds{{{I}}}', "s", 0, 0),
+  stat("Reboot needed", f'server_setup_reboot_required{{{I}}}', "none", 4, 0, thresholds=[{"color": "green", "value": None}, {"color": "orange", "value": 1}]),
+  stat("Security updates", f'server_setup_security_updates{{{I}}}', "none", 8, 0, thresholds=[{"color": "green", "value": None}, {"color": "orange", "value": 1}]),
+  stat("Failed services", f'sum by (instance) (node_systemd_unit_state{{{I},state="failed"}})', "none", 12, 0, thresholds=[{"color": "green", "value": None}, {"color": "red", "value": 1}]),
+  stat("Disk used (fullest)", f'max by (instance) (100 - 100 * node_filesystem_avail_bytes{{{I},fstype!~"tmpfs|overlay|squashfs|ramfs"}} / node_filesystem_size_bytes{{{I},fstype!~"tmpfs|overlay|squashfs|ramfs"}})', "percent", 16, 0, thresholds=[{"color": "green", "value": None}, {"color": "orange", "value": 80}, {"color": "red", "value": 90}]),
+  stat("Memory used", f'100 - 100 * node_memory_MemAvailable_bytes{{{I}}} / node_memory_MemTotal_bytes{{{I}}}', "percent", 20, 0, thresholds=[{"color": "green", "value": None}, {"color": "orange", "value": 80}, {"color": "red", "value": 90}]),
+  ts("CPU used", f'100 - 100 * avg by (instance) (rate(node_cpu_seconds_total{{{I},mode="idle"}}[2m]))', "percent", 0, 4),
+  ts("Load (15 min) per CPU", f'node_load15{{{I}}} / count by (instance) (node_cpu_seconds_total{{{I},mode="idle"}})', "none", 12, 4),
+  ts("Memory used", f'node_memory_MemTotal_bytes{{{I}}} - node_memory_MemAvailable_bytes{{{I}}}', "bytes", 0, 12),
+  ts("Disk free", f'node_filesystem_avail_bytes{{{I},fstype!~"tmpfs|overlay|squashfs|ramfs"}}', "bytes", 12, 12, legend="{{instance}} {{mountpoint}}"),
+  ts("Network in", f'sum by (instance) (rate(node_network_receive_bytes_total{{{I},device!~"lo|veth.*|docker.*|br-.*"}}[2m]))', "Bps", 0, 20),
+  ts("Network out", f'sum by (instance) (rate(node_network_transmit_bytes_total{{{I},device!~"lo|veth.*|docker.*|br-.*"}}[2m]))', "Bps", 12, 20),
+  ts("Disk I/O time", f'rate(node_disk_io_time_seconds_total{{{I}}}[2m])', "percentunit", 0, 28, legend="{{instance}} {{device}}"),
+  ts("Containers: CPU", f'sum by (instance, name) (rate(container_cpu_usage_seconds_total{{{I},name!=""}}[2m]))', "none", 12, 28, legend="{{instance}} {{name}}"),
+  ts("Containers: memory", f'sum by (instance, name) (container_memory_working_set_bytes{{{I},name!=""}})', "bytes", 0, 36, legend="{{instance}} {{name}}"),
+  {"type": "logs", "title": "Logs (errors and warnings)", "datasource": {"type": "loki", "uid": "loki"},
+   "gridPos": {"x": 12, "y": 36, "w": 12, "h": 16},
+   "targets": [{"refId": "A", "expr": '{host=~"$instance"} |~ "(?i)(error|fail|warn|denied|panic)"'}],
+   "options": {"showTime": True, "wrapLogMessage": True, "sortOrder": "Descending"}},
+]
+for i, p in enumerate(panels, 1):
+    p["id"] = i
+dash = {"uid": "server-setup-overview", "title": "Servers (server-setup)", "schemaVersion": 39, "version": 1,
+        "editable": False, "refresh": "1m", "time": {"from": "now-24h", "to": "now"},
+        "tags": ["server-setup"],
+        "templating": {"list": [{"name": "instance", "label": "Server", "type": "query",
+            "datasource": {"type": "prometheus", "uid": "vm"},
+            "query": {"query": "label_values(node_uname_info, instance)", "refId": "q"},
+            "definition": "label_values(node_uname_info, instance)",
+            "includeAll": True, "multi": True, "allValue": ".*", "refresh": 2,
+            "current": {"text": "All", "value": "$__all"}}]},
+        "panels": panels}
+print(json.dumps(dash, indent=1))
+PYEOF
+}
+
+render_caddyfile() { # the hub's gateway: TLS (Caddy's own CA) + one login for every agent
+  local hash=$1
+  cat <<EOF
+# Managed by server-setup: agents push here (metrics, logs, history imports)
+{
+  admin off
+  default_sni $MONITOR_HUB_ADDR
+}
+https://$MONITOR_HUB_ADDR:$HUB_PORT {
+  tls internal
+  basic_auth {
+    $MONITOR_USER $hash
+  }
+  handle /api/v1/write {
+    reverse_proxy victoriametrics:8428
+  }
+  handle /api/v1/import/native {
+    reverse_proxy victoriametrics:8428
+  }
+  handle /loki/api/v1/push {
+    reverse_proxy loki:3100
+  }
+  handle {
+    respond 404
+  }
+}
+EOF
+}
+
+apply_stack() {
+  local hub=n pw hash gpw
+  [[ $MONITOR == hub ]] && hub=y
+  os_installed docker-ce || install_tool docker
+  install -d -m 750 "$MON_DIR" "$MON_DIR/alerts" "$MON_DIR/grafana/dashboards"
+  render_compose "$hub" >"$MON_DIR/compose.yaml"
+  render_loki >"$MON_DIR/loki.yaml"
+  render_alert_rules >"$MON_DIR/alerts/server-setup.yml"
+  ( umask 077; render_alertmanager >"$MON_DIR/alertmanager.yml" ); chmod 644 "$MON_DIR/alertmanager.yml"
+  render_grafana_provisioning "$MON_DIR/grafana/provisioning"
+  render_dashboard >"$MON_DIR/grafana/dashboards/server-setup-overview.json"
+  gpw=$(secret_get grafana-admin || true)
+  if [[ -z $gpw ]]; then gpw=$(gen_password 20); secret_set grafana-admin "$gpw"; note_cred grafana "admin password" "$gpw"; fi
+  ( umask 077; cat >"$MON_DIR/grafana.env" <<EOF
+GF_SECURITY_ADMIN_USER=admin
+GF_SECURITY_ADMIN_PASSWORD=$gpw
+GF_ANALYTICS_REPORTING_ENABLED=false
+GF_ANALYTICS_CHECK_FOR_UPDATES=false
+GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES=false
+GF_NEWS_NEWS_FEED_ENABLED=false
+GF_PLUGINS_PREINSTALL_DISABLED=true
+GF_USERS_ALLOW_SIGN_UP=false
+GF_AUTH_ANONYMOUS_ENABLED=false
+EOF
+  )
+  if [[ $hub == y ]]; then
+    [[ -n ${MONITOR_HUB_ADDR-} ]] || MONITOR_HUB_ADDR=$(server_ip)
+    pw=$(secret_get monitor-password || true)
+    if [[ -z $pw ]]; then pw=$(gen_password 24); secret_set monitor-password "$pw"; fi
+    command -v htpasswd >/dev/null || os_install apache2-utils
+    # bcrypt from stdin (never on a command line); Caddy reads the 2a form
+    hash=$(printf '%s' "$pw" | htpasswd -niB "$MONITOR_USER" | cut -d: -f2- | sed 's/^\$2y\$/$2a$/')
+    ( umask 077; render_caddyfile "$hash" >"$MON_DIR/Caddyfile" ); chmod 644 "$MON_DIR/Caddyfile"
+  fi
+  chmod 700 "$MON_DIR"
+  run "Pulling the monitoring images" docker compose -f "$MON_DIR/compose.yaml" pull
+  run "Starting the monitoring stack" docker compose -f "$MON_DIR/compose.yaml" up -d --remove-orphans
+  if [[ $hub == y ]]; then
+    local src
+    if [[ -n ${MONITOR_ALLOW-} ]]; then
+      for src in $MONITOR_ALLOW; do ufw route allow proto tcp from "$src" to any port "$HUB_PORT" comment 'monitoring agents' >>"$LOG_FILE" 2>&1; done
+    else
+      ufw route allow proto tcp from any to any port "$HUB_PORT" comment 'monitoring agents' >>"$LOG_FILE" 2>&1
+      warn "The hub's port $HUB_PORT is open to everyone (it needs the agent login). Limit it: MONITOR_ALLOW in $CONF_FILE, then server-setup monitor apply"
+    fi
+  fi
+  save_config
+  note "Monitoring stack ($MONITOR) in $MON_DIR: VictoriaMetrics ($MONITOR_RETENTION), Loki ($LOG_RETENTION), Grafana, vmalert + Alertmanager, Uptime Kuma."
+  note "  Grafana: ssh -L 3000:127.0.0.1:3000 $(hostname -s) -> http://localhost:3000 (admin / see credentials). Uptime Kuma: ssh -L 3001:127.0.0.1:3001 -> http://localhost:3001"
+  [[ $hub == y ]] && note "  Hub: agents push to https://$MONITOR_HUB_ADDR:$HUB_PORT - on each server: sudo server-setup monitor join https://$MONITOR_HUB_ADDR:$HUB_PORT"
+}
+
+monitor_apply() {
+  case $MONITOR in
+    none) monitor_stop_agent; return 0 ;;
+    external) [[ -n ${MONITOR_METRICS_URL-} && -n ${MONITOR_LOGS_URL-} ]] || die "external needs MONITOR_METRICS_URL and MONITOR_LOGS_URL (server-setup monitor setup)." ;;
+    local|hub) apply_stack ;;
+    *) die "MONITOR must be none, external, local or hub." ;;
+  esac
+  install_agent
+}
+monitor_stop_agent() { systemctl disable --now alloy >>"$LOG_FILE" 2>&1 || true; }
+
+cmd_monitor() {
+  local action=${1-}; if (( $# > 0 )); then shift; fi
+  mon_defaults
+  case $action in
+    status|"")
+      info "Mode: $MONITOR$([[ $MONITOR == external ]] && echo " -> $MONITOR_METRICS_URL")"
+      if systemctl is-active --quiet alloy; then ok "Agent (alloy) running."; else warn "Agent (alloy) not running."; fi
+      if mon_stack_here; then docker compose -f "$MON_DIR/compose.yaml" ps --format 'table {{.Service}}\t{{.State}}\t{{.Status}}' 2>/dev/null | sed 's/^/    /'; fi ;;
+    setup) need_tty; monitor_prompt; save_config; monitor_apply ;;
+    apply) monitor_apply ;;
+    join)  # this server's agent pushes to a hub
+      need_tty
+      local url=${1-}
+      [[ $url =~ ^https?://[^/]+$ ]] || die "usage: server-setup monitor join https://<hub>:$HUB_PORT"
+      MONITOR=external MONITOR_METRICS_URL="$url/api/v1/write" MONITOR_LOGS_URL="$url/loki/api/v1/push"
+      prompt MONITOR_USER "Agent login on the hub" "$MONITOR_USER" accept_any
+      local pw; printf '%s?%s Agent password (sudo server-setup monitor token, on the hub): ' "$C_C" "$C_0" >/dev/tty
+      IFS= read -rs pw </dev/tty; printf '\n' >/dev/tty
+      [[ -n $pw ]] || die "The password is needed."
+      secret_set monitor-password "$pw"
+      MONITOR_INSECURE_TLS=y   # the hub's certificate comes from its own (Caddy) CA
+      save_config; install_agent; ok "This server now reports to $url." ;;
+    move-to) monitor_move_to "$@" ;;
+    token)
+      [[ $MONITOR == hub ]] || die "This server is not a monitoring hub."
+      info "On each server: sudo server-setup monitor join https://$MONITOR_HUB_ADDR:$HUB_PORT"
+      info "Login: $MONITOR_USER   password: $(secret_get monitor-password)" ;;
+    alerts) need_tty; alerts_prompt; save_config; mon_stack_here && { ( umask 077; render_alertmanager >"$MON_DIR/alertmanager.yml" ); chmod 644 "$MON_DIR/alertmanager.yml"; docker compose -f "$MON_DIR/compose.yaml" restart alertmanager >>"$LOG_FILE" 2>&1; }; ok "Alert receivers saved." ;;
+    *) die "usage: server-setup monitor status|setup|apply|join <hub-url>|move-to <hub-url>|token|alerts" ;;
+  esac
+}
+
+monitor_prompt() {
+  info "none: no monitoring. local: everything on this server. hub: everything here, other servers"
+  info "push to it. external: only the agent, pushing to a Prometheus-compatible + Loki you already run."
+  prompt MONITOR "Monitoring mode (none|local|hub|external)" "$MONITOR" valid_monitor_mode
+  case $MONITOR in
+    external)
+      prompt MONITOR_METRICS_URL "Prometheus remote_write URL (e.g. https://vm.example.com/api/v1/write)" "${MONITOR_METRICS_URL-}" valid_url
+      prompt MONITOR_LOGS_URL "Loki push URL (e.g. https://loki.example.com/loki/api/v1/push)" "${MONITOR_LOGS_URL-}" valid_url
+      prompt MONITOR_USER "Login (empty = none)" "${MONITOR_USER-}" accept_any
+      if [[ -n $MONITOR_USER ]]; then local pw; printf '%s?%s Password: ' "$C_C" "$C_0" >/dev/tty; IFS= read -rs pw </dev/tty; printf '\n' >/dev/tty; [[ -z $pw ]] || secret_set monitor-password "$pw"; fi ;;
+    hub)
+      prompt MONITOR_HUB_ADDR "Address the other servers use to reach this one (IP or DNS name)" "${MONITOR_HUB_ADDR:-$(server_ip)}" valid_host_list
+      prompt MONITOR_ALLOW "Servers allowed to push (IPs/CIDRs, empty = any with the login)" "${MONITOR_ALLOW-}" valid_ip_list ;;
+  esac
+  if mon_stack_here; then
+    prompt MONITOR_RETENTION "Keep metrics for (e.g. 90d, 1y)" "$MONITOR_RETENTION" valid_retention
+    prompt LOG_RETENTION "Keep logs for (e.g. 30d)" "$LOG_RETENTION" valid_retention
+    alerts_prompt
+  fi
+}
+valid_chat_id() { [[ -z $1 || $1 =~ ^-?[0-9]{1,20}$ ]] || { warn "A Telegram chat id is a number."; return 1; }; }
+valid_monitor_mode() { [[ $1 =~ ^(none|local|hub|external)$ ]] || { warn "Use none, local, hub or external."; return 1; }; }
+valid_retention() { [[ $1 =~ ^[0-9]{1,4}[dwy]$ ]] || { warn "Use e.g. 30d, 12w or 1y."; return 1; }; }
+
+alerts_prompt() {
+  info "Alerts go to any of: Telegram (needs internet), e-mail (SMTP), a webhook. Empty = skip."
+  prompt ALERT_TELEGRAM_CHAT "Telegram chat id (a number, e.g. -1001234567890)" "${ALERT_TELEGRAM_CHAT-}" valid_chat_id
+  if [[ -n $ALERT_TELEGRAM_CHAT ]]; then local t; printf '%s?%s Telegram bot token (empty = keep): ' "$C_C" "$C_0" >/dev/tty; IFS= read -rs t </dev/tty; printf '\n' >/dev/tty; [[ -z $t ]] || secret_set telegram-token "$t"; fi
+  prompt ALERT_EMAIL_TO "Alert e-mail to" "${ALERT_EMAIL_TO-}" accept_any
+  if [[ -n $ALERT_EMAIL_TO ]]; then
+    prompt ALERT_EMAIL_FROM "From address" "${ALERT_EMAIL_FROM:-alerts@$(hostname -f 2>/dev/null || hostname)}" accept_any
+    prompt ALERT_SMTP "SMTP server host:port" "${ALERT_SMTP-}" accept_any
+    prompt ALERT_SMTP_USER "SMTP login (empty = none)" "${ALERT_SMTP_USER-}" accept_any
+    if [[ -n $ALERT_SMTP_USER ]]; then local sp; printf '%s?%s SMTP password (empty = keep): ' "$C_C" "$C_0" >/dev/tty; IFS= read -rs sp </dev/tty; printf '\n' >/dev/tty; [[ -z $sp ]] || secret_set smtp-password "$sp"; fi
+  fi
+  prompt ALERT_WEBHOOK "Webhook URL (Slack/Mattermost/n8n...)" "${ALERT_WEBHOOK-}" valid_url_or_empty
+}
+
+monitor_move_to() { # a single server grows: its agent pushes to a hub, its history goes along
+  need_tty
+  local url=${1-} pw keep=y
+  [[ $url =~ ^https?://[^/]+$ ]] || die "usage: server-setup monitor move-to https://<hub>:$HUB_PORT"
+  [[ $MONITOR == local ]] || die "move-to is for a server that runs its own stack (mode local); this one is '$MONITOR'."
+  prompt MONITOR_USER "Agent login on the hub" "agent" accept_any
+  printf '%s?%s Agent password (on the hub: sudo server-setup monitor token): ' "$C_C" "$C_0" >/dev/tty
+  IFS= read -rs pw </dev/tty; printf '\n' >/dev/tty
+  prompt_yn keep "Copy this server's metric history to the hub first (logs stay here until the stack is removed)?" y
+  if [[ $keep == y ]]; then
+    # VictoriaMetrics' native export, streamed straight into the hub's native import; the
+    # login is in a private netrc file, never on a command line
+    local n; n=$(mktemp)
+    ( umask 077; printf 'machine %s\nlogin %s\npassword %s\n' "$(sed -E 's#^https?://##; s#:[0-9]+$##' <<<"$url")" "$MONITOR_USER" "$pw" >"$n" )
+    run "Copying metric history to $url (can take a while)" bash -c \
+      'set -o pipefail; curl -fsS -G "http://127.0.0.1:8428/api/v1/export/native" --data-urlencode "match[]={__name__!=\"\"}" \
+         | curl -fsS -k --netrc-file "$1" -X POST -T - "$2/api/v1/import/native"' _ "$n" "$url"
+    rm -f "$n"
+  fi
+  secret_set monitor-password "$pw"
+  MONITOR=external MONITOR_METRICS_URL="$url/api/v1/write" MONITOR_LOGS_URL="$url/loki/api/v1/push" MONITOR_INSECURE_TLS=y
+  save_config
+  install_agent
+  local stop=n; prompt_yn stop "Stop the local monitoring stack now? (its data volumes are kept)" y
+  if [[ $stop == y ]]; then run "Stopping the local stack" docker compose -f "$MON_DIR/compose.yaml" down; fi
+  ok "This server now reports to $url."
+}
+
+# ----------------------------------------------------------------------------
 # Setup
 # ----------------------------------------------------------------------------
 collect_answers() {
@@ -2109,6 +2803,7 @@ collect_answers() {
   info "Nothing is installed beyond hardening unless you list it. Tools: docker node python go nginx"
   info "caddy certbot postgresql postgresql-client redis restic, apt:<package> (later: server-setup tools install)."
   prompt NEW_TOOLS "Tools to install now (space-separated, empty = none)" "" valid_tool_list
+  monitor_prompt
 
   step "Plan"
   info "OS:                  $OS_ID $OS_VERSION ($OS_CODENAME, $OS_ARCH)"
@@ -2120,6 +2815,7 @@ collect_answers() {
   info "Reboots:             $([[ $AUTO_REBOOT == y ]] && echo "automatic at $REBOOT_TIME when needed" || echo 'never automatic')"
   info "Extras:              auditd $AUDITD, Lynis $LYNIS${PRO_TOKEN:+, Ubuntu Pro + Livepatch}"
   info "Tools:               ${NEW_TOOLS:-(none - hardening only)}"
+  info "Monitoring:          $MONITOR$([[ $MONITOR == external ]] && echo " -> $MONITOR_METRICS_URL")$([[ $MONITOR == hub ]] && echo " (agents push to https://$MONITOR_HUB_ADDR:$HUB_PORT)")"
 }
 valid_tool_list() {
   local t
@@ -2173,6 +2869,7 @@ cmd_setup() {
   if [[ $AUDITD == y ]]; then try_step "auditd" apply_auditd; fi
   local t
   for t in $NEW_TOOLS; do try_step "Tool: $t" install_tool "$t"; done
+  if [[ $MONITOR != none ]]; then try_step "Monitoring ($MONITOR)" monitor_apply; fi
   if step_ok "Users and SSH keys" && step_ok "Firewall"; then
     try_step "SSH hardening (ports $SSH_PORTS, auto-rollback)" ssh_apply $SSH_PORTS
   else
@@ -2312,6 +3009,9 @@ cmd_status() {
   fail2ban-client status sshd 2>/dev/null | grep -E 'Currently banned|Total banned' | sed 's/^[|` -]*/    /' || info "not running"
   step "Time"; info "$(timedatectl show -p NTPSynchronized --value 2>/dev/null | sed 's/yes/clock synchronized/; s/no/clock NOT synchronized/'), $(chronyc -n tracking 2>/dev/null | awk -F': ' '/^Reference ID/ {print "source " $2}')"
   step "Logs"; info "journal $(journalctl --disk-usage 2>/dev/null | grep -oE '[0-9.]+[KMGT]' | head -1) of $JOURNAL_MAX"
+  if [[ $MONITOR != none ]]; then step "Monitoring"; cmd_monitor status; fi
+  [[ -n $TOOLS ]] && { step "Tools"; info "$TOOLS"; }
+  return 0
 }
 
 write_report() { # write_report [what changed] - the whole report, from the current state
@@ -2394,6 +3094,11 @@ server-setup $SCRIPT_VERSION - hardened Ubuntu/Debian servers, online or interna
   apps list | add <name> --exec CMD [--port N] | remove <name>
                                An app as a sandboxed systemd service with its own user (/srv/<name>).
   backup init|run|status|list  Daily restic backups (local disk, SFTP, S3/MinIO).
+  monitor status|setup|apply|join <hub>|move-to <hub>|token|alerts
+                               Grafana Alloy agent on every server; the stack (VictoriaMetrics,
+                               Loki, Grafana, Alertmanager, Uptime Kuma) here (local), as a hub
+                               for many servers, or an existing one (external). move-to: a
+                               single server grows into a hub setup, with its history.
 
   ssh [--ports "22 9011"]      Re-apply the SSH hardening or change its ports (auto-rollback).
   confirm                      Keep a pending SSH change now (otherwise it is kept on the
@@ -2445,6 +3150,7 @@ main() {
     tools)    cmd_tools "$@" ;;
     apps)     cmd_apps "$@" ;;
     backup)   cmd_backup "$@" ;;
+    monitor)  cmd_monitor "$@" ;;
     confirm)  ssh_change_pending || die "No SSH change is pending."; ssh_finalize; ok "SSH change kept (ports $SSH_PORTS)." ;;
     *) usage >&2; exit 2 ;;
   esac
