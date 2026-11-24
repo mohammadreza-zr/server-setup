@@ -21,7 +21,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="0.6.2"
+readonly SCRIPT_VERSION="0.6.3"
 readonly INSTALL_PATH="/usr/local/sbin/server-setup"
 readonly LIB_DIR="/usr/local/lib/server-setup"
 readonly STATE_DIR="/etc/server-setup"
@@ -1394,7 +1394,8 @@ ssh_restore_files() {
 }
 
 ssh_restore() { # restore the snapshot and run sshd the way it ran before
-  local f d
+  local f d new=() old="" p
+  mapfile -t new < <(awk '/^Port / {print $2}' "$(ssh_dropin)" 2>/dev/null)   # the rejected ports
   ssh_restore_files || return 1
   for f in "$ROLLBACK_DIR"/*--*.conf; do
     [[ -f $f ]] || continue
@@ -1411,7 +1412,13 @@ ssh_restore() { # restore the snapshot and run sshd the way it ran before
     systemctl restart ssh.service
   fi
   rm -f "$ROLLBACK_DIR/applied_at"
-  if [[ -f $ROLLBACK_DIR/old_ports ]]; then apply_fail2ban $(cat "$ROLLBACK_DIR/old_ports") || true; fi
+  if [[ -f $ROLLBACK_DIR/old_ports ]]; then
+    old=$(xargs <"$ROLLBACK_DIR/old_ports")
+    apply_fail2ban $old || true
+    # close what the rejected change opened, and remember the ports sshd really uses again
+    for p in "${new[@]}"; do [[ " $old " == *" $p "* ]] || fw_close_ssh_port "$p"; done
+    if [[ -n $old ]]; then SSH_PORTS=$old; save_config; fi
+  fi
   log_file "SSH configuration rolled back"
 }
 
