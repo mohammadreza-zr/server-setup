@@ -2,7 +2,7 @@
 
 Turn a fresh **Ubuntu or Debian** server into a **hardened server that runs for years**: production backends, Dokploy nodes and monitoring hubs. It works with normal internet access or inside an **internal network** where only a mirror is reachable, and it keeps managing the server afterwards.
 
-> **Status: phase 3 of 5.** Implemented: the *base* role (hardening, users, SSH, firewall, long-uptime tuning, download sources), the *app* role (opt-in tools, app services, backups) and *monitor* (agent + stack, single server to hub). *dokploy-node* and *fleet* come next.
+> **Status: phase 4 of 5.** Implemented: *base* (hardening, users, SSH, firewall, long-uptime tuning, download sources), *app* (opt-in tools, app services, backups), *monitor* (agent + stack, single server to hub) and *dokploy-node*. *fleet* comes next.
 
 | | |
 |---|---|
@@ -140,6 +140,30 @@ sudo server-setup monitor move-to https://hub:8430        # a 'local' server gro
 
 They go to Telegram (needs internet), e-mail (SMTP) and/or a webhook. Grafana and Uptime Kuma listen on localhost only, reached through SSH: `ssh -L 3000:127.0.0.1:3000 <server>`. Nothing reports usage to Grafana Labs, and Grafana doesn't preinstall plugins from the internet.
 
+## Dokploy node: a server managed by a remote Dokploy panel
+
+The Dokploy panel runs elsewhere. It logs in to this server over SSH and runs its **Setup Server** script, and each step of that script is skipped when its result already exists. `dokploy-node` creates all of those results ahead of time, through the direct-or-mirror sources. So "Setup Server" also works on a server **without internet**:
+
+| Panel step | Done here instead |
+|---|---|
+| utilities, rclone (`rclone.org/install.sh`) | apt |
+| Docker (`get.docker.com`, compose from GitHub) | Docker's apt repo (Swarm-ready, logs capped, firewall-aware) |
+| Swarm (address from `ifconfig.io`) | `swarm init` with the address you give / the routing address |
+| `dokploy-network` | created |
+| Traefik container (`docker run traefik:v3.7.19`) | image pulled in advance; the panel still writes its config and starts it |
+| nixpacks, railpack, pack (install scripts) | the pinned GitHub releases (pack checksum-verified) |
+
+```bash
+sudo server-setup dokploy-node prepare            # asks for the panel's SSH key and IP
+sudo server-setup dokploy-node status
+sudo server-setup dokploy-node sync v0.26.0       # a newer panel: read its versions from Dokploy's source
+```
+
+- **Panel access:** the panel logs in as `dokploy`, key-only and **only from the panel's IP**, with no forwarding. Dokploy requires passwordless sudo and the docker group, so this user is effectively root. That's said plainly in the report. Root login stays off.
+- **Firewall:** 80/443 are open for Traefik (including HTTP/3). Swarm ports 2377/7946/4789 are open only to the Swarm peers you list.
+- **Updates:** Docker and containerd are never restarted by automatic updates, which would restart every app.
+- **Building without internet:** Dockerfile builds work, with Docker Hub images through the mirror. Nixpacks/Railpack also pull **ghcr.io** images, which Docker can't mirror. For those, add a ghcr.io proxy to Nexus and pre-pull the images, or use Dockerfiles. Builds that run npm/pip/go need the mirror URLs as build variables in Dokploy; the report prints them.
+
 ## Commands
 
 ```text
@@ -155,6 +179,7 @@ tools list | install <tool>... [--version V] [--prefix DIR] [--sha256 H] | remov
 apps list | add <name> --exec CMD [--port N] | remove <name>
 backup init|run|status|list
 monitor status|setup|apply|join <hub>|move-to <hub>|token|alerts
+dokploy-node prepare|status|sync [<dokploy-version>]
 ssh [--ports "22 9011"]      Re-apply SSH hardening / change ports (auto-rollback).
 confirm                      Keep a pending SSH change now.
 ```
@@ -175,5 +200,5 @@ confirm                      Keep a pending SSH change now.
 1. ~~Framework, download sources, base role~~ ✅
 2. ~~**app**: opt-in tools catalog, app services, restic backups~~ ✅
 3. ~~**monitor**: Alloy agent; local / hub / external stack; move-to~~ ✅
-4. **dokploy-node**: prepares a server to be managed by a remote Dokploy panel, with all of Dokploy's setup steps done ahead of time so "Setup Server" works without internet.
+4. ~~**dokploy-node**: Dokploy's Setup Server steps done ahead of time~~ ✅
 5. **fleet**: manage many servers from the hub.

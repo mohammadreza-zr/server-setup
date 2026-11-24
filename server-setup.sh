@@ -21,7 +21,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="0.3.0"
+readonly SCRIPT_VERSION="0.4.0"
 readonly INSTALL_PATH="/usr/local/sbin/server-setup"
 readonly LIB_DIR="/usr/local/lib/server-setup"
 readonly STATE_DIR="/etc/server-setup"
@@ -70,6 +70,9 @@ MONITOR="" MONITOR_RETENTION="" LOG_RETENTION="" MONITOR_USER="" MONITOR_METRICS
 MONITOR_HUB_ADDR="" MONITOR_ALLOW="" MONITOR_INSECURE_TLS="" GRAFANA_PUBLIC=""
 ALERT_TELEGRAM_CHAT="" ALERT_EMAIL_TO="" ALERT_EMAIL_FROM="" ALERT_SMTP="" ALERT_SMTP_USER="" ALERT_WEBHOOK=""
 IMG_VM="" IMG_VMALERT="" IMG_LOKI="" IMG_GRAFANA="" IMG_ALERTMANAGER="" IMG_KUMA="" IMG_CADDY=""
+# Dokploy node (dokploy-node role)
+DOKPLOY_NODE="" DOKPLOY_USER="" DOKPLOY_KEY="" DOKPLOY_PANEL_IP="" DOKPLOY_ADVERTISE_ADDR="" DOKPLOY_SWARM_PEERS=""
+TRAEFIK_VERSION="" NIXPACKS_VERSION="" RAILPACK_VERSION="" PACK_VERSION=""
 # Per source: SRC_<name> = auto|direct|mirror|none (what the admin wants),
 #             ROUTE_<name> = direct|mirror|none (what is in use now)
 readonly SOURCES="apt ntp dockerhub ghcr dockerapt grafanaapt nodesource npm pypi go godl github"
@@ -85,7 +88,9 @@ CONF_KEYS="ADMIN_USER DEPLOY_USER SSH_PORTS SSH_ALLOW TRUSTED_IPS OPEN_PORTS AUT
   REPO_NPM REPO_PYPI REPO_GO REPO_GODL REPO_GITHUB TOOLS NODE_MAJOR BACKUP_REPO BACKUP_PATHS BACKUP_TIME BACKUP_KEEP
   MONITOR MONITOR_RETENTION LOG_RETENTION MONITOR_USER MONITOR_METRICS_URL MONITOR_LOGS_URL MONITOR_HUB_ADDR
   MONITOR_ALLOW MONITOR_INSECURE_TLS GRAFANA_PUBLIC ALERT_TELEGRAM_CHAT ALERT_EMAIL_TO ALERT_EMAIL_FROM ALERT_SMTP
-  ALERT_SMTP_USER ALERT_WEBHOOK IMG_VM IMG_VMALERT IMG_LOKI IMG_GRAFANA IMG_ALERTMANAGER IMG_KUMA IMG_CADDY"
+  ALERT_SMTP_USER ALERT_WEBHOOK IMG_VM IMG_VMALERT IMG_LOKI IMG_GRAFANA IMG_ALERTMANAGER IMG_KUMA IMG_CADDY
+  DOKPLOY_NODE DOKPLOY_USER DOKPLOY_KEY DOKPLOY_PANEL_IP DOKPLOY_ADVERTISE_ADDR DOKPLOY_SWARM_PEERS
+  TRAEFIK_VERSION NIXPACKS_VERSION RAILPACK_VERSION PACK_VERSION"
 for _s in $SOURCES; do CONF_KEYS+=" SRC_$_s ROUTE_$_s"; done; unset _s
 
 # Answers of this run that are not saved
@@ -109,6 +114,8 @@ defaults() { # fill every setting that is still empty
   local s v
   for s in $SOURCES; do v="SRC_$s"; [[ -n ${!v} ]] || printf -v "$v" auto; done
   mon_defaults
+  dokploy_defaults
+  : "${DOKPLOY_NODE:=n}"
 }
 # Output
 # ----------------------------------------------------------------------------
@@ -2734,6 +2741,199 @@ monitor_move_to() { # a single server grows: its agent pushes to a hub, its hist
 }
 
 # ----------------------------------------------------------------------------
+# dokploy-node role: this server is a REMOTE SERVER of a Dokploy panel that runs elsewhere
+# (the panel is not installed here). The panel connects over SSH and runs its "Setup Server"
+# script (Dokploy packages/server/src/setup/server-setup.ts); every step of it is skipped when
+# its result already exists. This role creates those results ahead of time through the chosen
+# sources - so "Setup Server" also works on a server without internet:
+#   utilities + rclone (apt) | Docker (Docker's apt repo, not get.docker.com) | Swarm (advertise
+#   address from the routes, not ifconfig.io) | dokploy-network | the Traefik image, pulled |
+#   nixpacks, railpack, pack (GitHub releases, direct or mirror) | a 'dokploy' user for the panel
+# The panel itself still writes Traefik's config and starts it (no internet needed for that).
+# ----------------------------------------------------------------------------
+dokploy_defaults() {
+  : "${DOKPLOY_USER:=dokploy}" "${TRAEFIK_VERSION:=3.7.19}" "${NIXPACKS_VERSION:=1.41.0}"
+  : "${RAILPACK_VERSION:=0.15.4}" "${PACK_VERSION:=0.39.1}"
+}
+
+# docker_pull <image> - a Docker Hub image through the dockerhub source. With the mirror:
+# registry-mirrors first (anonymous), then the mirror's own name (logged in) + the usual tag.
+docker_pull() {
+  local img=$1 path
+  if docker image inspect "$img" >/dev/null 2>&1; then return 0; fi
+  if run_soft "Pulling $img" docker pull "$img"; then return 0; fi
+  [[ $(route_of dockerhub) == mirror ]] || die "Could not pull $img."
+  path=$img; [[ $path == */* ]] || path="library/$path"
+  run "Pulling $img as $MIRROR_DOCKER_REGISTRY/$path" docker pull "$MIRROR_DOCKER_REGISTRY/$path"
+  docker tag "$MIRROR_DOCKER_REGISTRY/$path" "$img"
+}
+
+# install_release_binary <name> <url> <binary-in-archive> [sha256-url]
+install_release_binary() {
+  local name=$1 url=$2 bin=$3 sumurl=${4-} tmp want
+  tmp=$(mktemp -d)
+  fetch github "$url" "$tmp/archive"
+  if [[ -n $sumurl ]]; then
+    fetch github "$sumurl" "$tmp/sum"
+    want=$(awk '{print $1}' "$tmp/sum")
+    printf '%s  %s\n' "$want" "$tmp/archive" | sha256sum -c --quiet - || { rm -rf "$tmp"; die "Checksum mismatch for $name."; }
+  fi
+  tar -C "$tmp" -xzf "$tmp/archive"
+  local f; f=$(find "$tmp" -type f -name "$bin" | head -n1)
+  [[ -n $f ]] || { rm -rf "$tmp"; die "$bin not found in the $name archive."; }
+  install -m 755 "$f" "/usr/local/bin/$bin"
+  rm -rf "$tmp"
+}
+
+dokploy_advertise_addr() { # the address Swarm advertises: asked, or the one routing to the world
+  [[ -n ${DOKPLOY_ADVERTISE_ADDR-} ]] && { printf '%s' "$DOKPLOY_ADVERTISE_ADDR"; return 0; }
+  local ip; ip=$(server_ip)
+  [[ $ip != "<server-ip>" ]] || die "Could not find this server's address - set DOKPLOY_ADVERTISE_ADDR (server-setup dokploy-node prepare)."
+  printf '%s' "$ip"
+}
+
+dokploy_prepare() {
+  local a arch
+  dokploy_defaults
+  arch=$OS_ARCH; [[ $arch == amd64 || $arch == arm64 ]] || die "Dokploy's build tools have no $arch build."
+  # 1. utilities the panel's script installs (from apt - direct or mirror)
+  os_install curl wget git git-lfs jq openssl unzip tar rclone
+  # 2. Docker (Swarm-ready: no live-restore), logs capped, ports filtered by ufw
+  OPEN_PORTS=$(uniq_words $OPEN_PORTS 80 443 443/udp)
+  install_docker y
+  # Docker and containerd are not restarted by automatic updates (that would restart every app)
+  if [[ -d /etc/needrestart/conf.d ]]; then
+    printf "# Managed by server-setup: never restart Docker by itself (all apps would restart)\n\$nrconf{override_rc}{qr(^docker)} = 0;\n\$nrconf{override_rc}{qr(^containerd)} = 0;\n" \
+      >/etc/needrestart/conf.d/91-server-setup-docker.conf
+  fi
+  # 3. Swarm + the overlay network the panel expects
+  if ! docker_swarm_active; then
+    run "Starting Docker Swarm" docker swarm init --advertise-addr "$(dokploy_advertise_addr)"
+  fi
+  if ! docker network inspect dokploy-network >/dev/null 2>&1; then
+    run "Creating dokploy-network" docker network create --driver overlay --attachable dokploy-network
+  fi
+  # 4. Traefik's image, so the panel's `docker run traefik:v...` needs no internet
+  need_source dockerhub
+  docker_pull "traefik:v$TRAEFIK_VERSION"
+  # 5. the build tools (the panel skips each one that exists)
+  local nx rp
+  nx="x86_64-unknown-linux-musl"; [[ $arch == arm64 ]] && nx="aarch64-unknown-linux-musl"
+  rp="x86_64-unknown-linux-musl"; [[ $arch == arm64 ]] && rp="arm64-unknown-linux-musl"
+  command -v nixpacks >/dev/null || install_release_binary nixpacks \
+    "https://github.com/railwayapp/nixpacks/releases/download/v$NIXPACKS_VERSION/nixpacks-v$NIXPACKS_VERSION-$nx.tar.gz" nixpacks
+  command -v railpack >/dev/null || install_release_binary railpack \
+    "https://github.com/railwayapp/railpack/releases/download/v$RAILPACK_VERSION/railpack-v$RAILPACK_VERSION-$rp.tar.gz" railpack
+  local pk="linux"; [[ $arch == arm64 ]] && pk="linux-arm64"
+  command -v pack >/dev/null || install_release_binary pack \
+    "https://github.com/buildpacks/pack/releases/download/v$PACK_VERSION/pack-v$PACK_VERSION-$pk.tgz" pack \
+    "https://github.com/buildpacks/pack/releases/download/v$PACK_VERSION/pack-v$PACK_VERSION-$pk.tgz.sha256"
+  # 6. the user the panel logs in as
+  dokploy_user
+  # 7. Swarm ports between this server and its peers only
+  for a in ${DOKPLOY_SWARM_PEERS-}; do
+    ufw allow from "$a" to any port 2377 proto tcp comment 'swarm' >>"$LOG_FILE"
+    ufw allow from "$a" to any port 7946 comment 'swarm' >>"$LOG_FILE"
+    ufw allow from "$a" to any port 4789 proto udp comment 'swarm overlay' >>"$LOG_FILE"
+  done
+  step_firewall
+  ROLES=$(uniq_words $ROLES dokploy-node); save_config
+  note "Dokploy node ready: Docker $(docker version --format '{{.Server.Version}}' 2>/dev/null) in Swarm mode, dokploy-network, traefik:v$TRAEFIK_VERSION pulled, nixpacks $NIXPACKS_VERSION, railpack $RAILPACK_VERSION, pack $PACK_VERSION."
+  note "  In the panel: Servers -> Create: IP $(dokploy_advertise_addr), port $(ssh_main_port), user $DOKPLOY_USER, the panel's SSH key -> Setup Server."
+  note "  Ports 80/443 open (Traefik); the panel's address: ${DOKPLOY_PANEL_IP:-any (no restriction set)}."
+  if [[ $(route_of dockerhub) == mirror || $(route_of github) == mirror ]]; then
+    note "  Without internet: Dockerfile builds work (Docker Hub images through the mirror). Nixpacks/Railpack builds also need"
+    note "  ghcr.io images - Docker can't mirror ghcr.io; add a ghcr.io proxy to Nexus and pre-pull them, or use Dockerfiles."
+    note "  App builds that run npm/pip/go need the mirror too: set NPM_CONFIG_REGISTRY / PIP_INDEX_URL / GOPROXY as build"
+    note "  variables in Dokploy (values: $(mirror_base)/repository/$REPO_NPM/, .../$REPO_PYPI/simple, .../$REPO_GO/)."
+  fi
+}
+
+dokploy_user() {
+  local u=$DOKPLOY_USER home key opts=""
+  ensure_group "$SSH_GROUP"
+  ensure_user "$u" deploy
+  usermod -aG docker "$u"
+  # Dokploy runs its setup with `sudo` (it requires passwordless sudo) - so this user IS root.
+  printf '# Managed by server-setup: the Dokploy panel runs its server setup with sudo\n%s ALL=(ALL) NOPASSWD:ALL\n' "$u" >/etc/sudoers.d/60-server-setup-dokploy
+  chmod 440 /etc/sudoers.d/60-server-setup-dokploy
+  visudo -cq || { rm -f /etc/sudoers.d/60-server-setup-dokploy; die "sudoers check failed for the dokploy user."; }
+  install -d -m 755 /etc/dokploy; chown -R "$u:$u" /etc/dokploy
+  if [[ -n ${DOKPLOY_KEY-} ]]; then
+    key=$(normalize_pubkey "$DOKPLOY_KEY") || die "The Dokploy panel's key is not a valid SSH public key."
+    # only from the panel, and only as a command shell (no forwarding of any kind)
+    [[ -n ${DOKPLOY_PANEL_IP-} ]] && opts="from=\"$DOKPLOY_PANEL_IP\","
+    opts+="no-port-forwarding,no-agent-forwarding,no-X11-forwarding"
+    home=$(home_of "$u")
+    runuser -u "$u" -- sh -c 'umask 077; mkdir -p "$1/.ssh"; : >"$1/.ssh/authorized_keys"' sh "$home"
+    printf '%s %s\n' "$opts" "$key" | runuser -u "$u" -- tee "$home/.ssh/authorized_keys" >/dev/null
+  fi
+  if [[ -n $SSH_ALLOW && -n ${DOKPLOY_PANEL_IP-} ]]; then SSH_ALLOW=$(uniq_words $SSH_ALLOW "$DOKPLOY_PANEL_IP"); fi
+  note "Dokploy panel user '$u': key-only${DOKPLOY_PANEL_IP:+, only from $DOKPLOY_PANEL_IP}; passwordless sudo + docker group (Dokploy requires it - this user is effectively root)."
+}
+
+dokploy_prompt() {
+  dokploy_defaults
+  info "The Dokploy panel (installed elsewhere) manages this server over SSH. In the panel: Settings ->"
+  info "SSH Keys -> create a key and copy its public part; you paste it here."
+  prompt DOKPLOY_KEY "The panel's SSH public key" "${DOKPLOY_KEY-}" valid_pubkey_or_empty
+  prompt DOKPLOY_PANEL_IP "The panel's IP address (only it may log in as $DOKPLOY_USER; empty = any)" "${DOKPLOY_PANEL_IP-}" valid_ip_list
+  prompt DOKPLOY_ADVERTISE_ADDR "This server's address for Swarm" "${DOKPLOY_ADVERTISE_ADDR:-$(server_ip)}" valid_host_list
+  prompt DOKPLOY_SWARM_PEERS "Other Swarm nodes (IPs, empty = this server alone)" "${DOKPLOY_SWARM_PEERS-}" valid_ip_list
+}
+valid_pubkey_or_empty() { [[ -z $1 ]] || normalize_pubkey "$1" >/dev/null || { warn "Not an SSH public key."; return 1; }; }
+
+cmd_dokploy_node() {
+  local action=${1-}; if (( $# > 0 )); then shift; fi
+  dokploy_defaults
+  case $action in
+    prepare) need_tty; dokploy_prompt; save_config; dokploy_prepare; print_credentials ;;
+    status|"")
+      info "Versions: traefik $TRAEFIK_VERSION, nixpacks $NIXPACKS_VERSION, railpack $RAILPACK_VERSION, pack $PACK_VERSION"
+      if docker_swarm_active; then ok "Swarm active."; else warn "Swarm not active."; fi
+      if docker network inspect dokploy-network >/dev/null 2>&1; then ok "dokploy-network exists."; else warn "dokploy-network missing."; fi
+      if docker inspect dokploy-traefik >/dev/null 2>&1; then ok "Traefik running (set up by the panel)."; else info "Traefik not started yet - the panel's 'Setup Server' does that."; fi
+      local b; for b in nixpacks railpack pack rclone; do command -v "$b" >/dev/null && ok "$b: $("$b" --version 2>/dev/null | head -n1)" || warn "$b missing"; done ;;
+    sync) dokploy_sync "$@" ;;
+    *) die "usage: server-setup dokploy-node prepare | status | sync [<dokploy-version>] [--traefik V --nixpacks V --railpack V --pack V]" ;;
+  esac
+}
+
+# dokploy_sync - match the versions a newer panel expects (read from Dokploy's own source, or given)
+dokploy_sync() {
+  local tag="" t src tmp
+  while (( $# > 0 )); do
+    case $1 in
+      --traefik) TRAEFIK_VERSION=${2-}; shift ;; --nixpacks) NIXPACKS_VERSION=${2-}; shift ;;
+      --railpack) RAILPACK_VERSION=${2-}; shift ;; --pack) PACK_VERSION=${2-}; shift ;;
+      -*) die "Unknown option $1" ;; *) tag=$1 ;;
+    esac
+    shift
+  done
+  if [[ -n $tag ]]; then
+    [[ $tag =~ ^(v[0-9]+\.[0-9]+\.[0-9]+|canary|main)$ ]] || die "Give a Dokploy release such as v0.25.0."
+    src="https://raw.githubusercontent.com/Dokploy/dokploy/$tag/packages/server/src/setup"
+    tmp=$(mktemp -d)
+    curl -fsSL -m 30 -o "$tmp/s.ts" "$src/server-setup.ts" && curl -fsSL -m 30 -o "$tmp/t.ts" "$src/traefik-setup.ts" \
+      || { rm -rf "$tmp"; die "Dokploy's source for $tag is not reachable - give the versions: --traefik V --nixpacks V --railpack V --pack V"; }
+    t=$(grep -oE 'TRAEFIK_VERSION \|\| "[0-9.]+"' "$tmp/t.ts" | grep -oE '[0-9.]+' | head -n1); [[ -n $t ]] && TRAEFIK_VERSION=$t
+    t=$(grep -oE 'NIXPACKS_VERSION=[0-9.]+' "$tmp/s.ts" | cut -d= -f2 | head -n1); [[ -n $t ]] && NIXPACKS_VERSION=$t
+    t=$(grep -oE 'RAILPACK_VERSION=[0-9.]+' "$tmp/s.ts" | cut -d= -f2 | head -n1); [[ -n $t ]] && RAILPACK_VERSION=$t
+    t=$(grep -oE 'BUILDPACKS_VERSION=[0-9.]+' "$tmp/s.ts" | cut -d= -f2 | head -n1); [[ -n $t ]] && PACK_VERSION=$t
+    rm -rf "$tmp"
+  fi
+  save_config
+  ok "Versions: traefik $TRAEFIK_VERSION, nixpacks $NIXPACKS_VERSION, railpack $RAILPACK_VERSION, pack $PACK_VERSION"
+  # replace the build tools that changed, pull the new Traefik image
+  local b want
+  for b in nixpacks railpack pack; do
+    case $b in nixpacks) want=$NIXPACKS_VERSION ;; railpack) want=$RAILPACK_VERSION ;; pack) want=$PACK_VERSION ;; esac
+    if command -v "$b" >/dev/null && ! "$b" --version 2>/dev/null | grep -qF "$want"; then rm -f "/usr/local/bin/$b"; fi
+  done
+  dokploy_prepare
+}
+
+# ----------------------------------------------------------------------------
 # Setup
 # ----------------------------------------------------------------------------
 collect_answers() {
@@ -2803,6 +3003,8 @@ collect_answers() {
   info "Nothing is installed beyond hardening unless you list it. Tools: docker node python go nginx"
   info "caddy certbot postgresql postgresql-client redis restic, apt:<package> (later: server-setup tools install)."
   prompt NEW_TOOLS "Tools to install now (space-separated, empty = none)" "" valid_tool_list
+  prompt_yn DOKPLOY_NODE "Prepare this server as a remote server for a Dokploy panel (Docker Swarm, Traefik, build tools)?" "$DOKPLOY_NODE"
+  if [[ $DOKPLOY_NODE == y ]]; then dokploy_prompt; fi
   monitor_prompt
 
   step "Plan"
@@ -2815,6 +3017,7 @@ collect_answers() {
   info "Reboots:             $([[ $AUTO_REBOOT == y ]] && echo "automatic at $REBOOT_TIME when needed" || echo 'never automatic')"
   info "Extras:              auditd $AUDITD, Lynis $LYNIS${PRO_TOKEN:+, Ubuntu Pro + Livepatch}"
   info "Tools:               ${NEW_TOOLS:-(none - hardening only)}"
+  info "Dokploy node:        $DOKPLOY_NODE${DOKPLOY_PANEL_IP:+ (panel $DOKPLOY_PANEL_IP)}"
   info "Monitoring:          $MONITOR$([[ $MONITOR == external ]] && echo " -> $MONITOR_METRICS_URL")$([[ $MONITOR == hub ]] && echo " (agents push to https://$MONITOR_HUB_ADDR:$HUB_PORT)")"
 }
 valid_tool_list() {
@@ -2869,6 +3072,7 @@ cmd_setup() {
   if [[ $AUDITD == y ]]; then try_step "auditd" apply_auditd; fi
   local t
   for t in $NEW_TOOLS; do try_step "Tool: $t" install_tool "$t"; done
+  if [[ $DOKPLOY_NODE == y ]]; then try_step "Dokploy node (Docker Swarm, Traefik image, build tools, panel user)" dokploy_prepare; fi
   if [[ $MONITOR != none ]]; then try_step "Monitoring ($MONITOR)" monitor_apply; fi
   if step_ok "Users and SSH keys" && step_ok "Firewall"; then
     try_step "SSH hardening (ports $SSH_PORTS, auto-rollback)" ssh_apply $SSH_PORTS
@@ -3010,6 +3214,7 @@ cmd_status() {
   step "Time"; info "$(timedatectl show -p NTPSynchronized --value 2>/dev/null | sed 's/yes/clock synchronized/; s/no/clock NOT synchronized/'), $(chronyc -n tracking 2>/dev/null | awk -F': ' '/^Reference ID/ {print "source " $2}')"
   step "Logs"; info "journal $(journalctl --disk-usage 2>/dev/null | grep -oE '[0-9.]+[KMGT]' | head -1) of $JOURNAL_MAX"
   if [[ $MONITOR != none ]]; then step "Monitoring"; cmd_monitor status; fi
+  if [[ $DOKPLOY_NODE == y ]]; then step "Dokploy node"; cmd_dokploy_node status; fi
   [[ -n $TOOLS ]] && { step "Tools"; info "$TOOLS"; }
   return 0
 }
@@ -3094,6 +3299,11 @@ server-setup $SCRIPT_VERSION - hardened Ubuntu/Debian servers, online or interna
   apps list | add <name> --exec CMD [--port N] | remove <name>
                                An app as a sandboxed systemd service with its own user (/srv/<name>).
   backup init|run|status|list  Daily restic backups (local disk, SFTP, S3/MinIO).
+  dokploy-node prepare|status|sync [<dokploy-version>]
+                               Make this server a remote server of a Dokploy panel elsewhere: every
+                               internet-dependent step of the panel's "Setup Server" is done here
+                               ahead of time (through the mirror when needed). sync: match a newer
+                               panel's Traefik/nixpacks/railpack/pack versions.
   monitor status|setup|apply|join <hub>|move-to <hub>|token|alerts
                                Grafana Alloy agent on every server; the stack (VictoriaMetrics,
                                Loki, Grafana, Alertmanager, Uptime Kuma) here (local), as a hub
@@ -3151,6 +3361,7 @@ main() {
     apps)     cmd_apps "$@" ;;
     backup)   cmd_backup "$@" ;;
     monitor)  cmd_monitor "$@" ;;
+    dokploy-node) cmd_dokploy_node "$@" ;;
     confirm)  ssh_change_pending || die "No SSH change is pending."; ssh_finalize; ok "SSH change kept (ports $SSH_PORTS)." ;;
     *) usage >&2; exit 2 ;;
   esac
