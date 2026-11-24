@@ -21,7 +21,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="0.1.0"
+readonly SCRIPT_VERSION="0.2.0"
 readonly INSTALL_PATH="/usr/local/sbin/server-setup"
 readonly LIB_DIR="/usr/local/lib/server-setup"
 readonly STATE_DIR="/etc/server-setup"
@@ -62,25 +62,27 @@ ROLES="" SETUP_DONE=""
 MIRROR_URL="" MIRROR_USER=""
 REPO_UBUNTU="" REPO_UBUNTU_SECURITY="" REPO_UBUNTU_PORTS="" REPO_DEBIAN="" REPO_DEBIAN_SECURITY=""
 REPO_DOCKER_APT="" REPO_GRAFANA_APT="" REPO_NODESOURCE_APT="" MIRROR_DOCKER_REGISTRY=""
-REPO_NPM="" REPO_PYPI="" REPO_GO="" REPO_GITHUB=""
+REPO_NPM="" REPO_PYPI="" REPO_GO="" REPO_GODL="" REPO_GITHUB=""
+# Tools (app role) and backups
+TOOLS="" NODE_MAJOR="" BACKUP_REPO="" BACKUP_PATHS="" BACKUP_TIME="" BACKUP_KEEP=""
 # Per source: SRC_<name> = auto|direct|mirror|none (what the admin wants),
 #             ROUTE_<name> = direct|mirror|none (what is in use now)
-readonly SOURCES="apt ntp dockerhub ghcr dockerapt grafanaapt nodesource npm pypi go github"
+readonly SOURCES="apt ntp dockerhub ghcr dockerapt grafanaapt nodesource npm pypi go godl github"
 SRC_apt="" SRC_ntp="" SRC_dockerhub="" SRC_ghcr="" SRC_dockerapt="" SRC_grafanaapt="" SRC_nodesource=""
-SRC_npm="" SRC_pypi="" SRC_go="" SRC_github=""
+SRC_npm="" SRC_pypi="" SRC_go="" SRC_godl="" SRC_github=""
 ROUTE_apt="" ROUTE_ntp="" ROUTE_dockerhub="" ROUTE_ghcr="" ROUTE_dockerapt="" ROUTE_grafanaapt=""
-ROUTE_nodesource="" ROUTE_npm="" ROUTE_pypi="" ROUTE_go="" ROUTE_github=""
+ROUTE_nodesource="" ROUTE_npm="" ROUTE_pypi="" ROUTE_go="" ROUTE_godl="" ROUTE_github=""
 
 CONF_KEYS="ADMIN_USER DEPLOY_USER SSH_PORTS SSH_ALLOW TRUSTED_IPS OPEN_PORTS AUTO_REBOOT REBOOT_TIME
   TIMEZONE NTP_SERVERS JOURNAL_MAX AUDITD LYNIS ROLES SETUP_DONE MIRROR_URL MIRROR_USER
   REPO_UBUNTU REPO_UBUNTU_SECURITY REPO_UBUNTU_PORTS REPO_DEBIAN REPO_DEBIAN_SECURITY
   REPO_DOCKER_APT REPO_GRAFANA_APT REPO_NODESOURCE_APT MIRROR_DOCKER_REGISTRY
-  REPO_NPM REPO_PYPI REPO_GO REPO_GITHUB"
+  REPO_NPM REPO_PYPI REPO_GO REPO_GODL REPO_GITHUB TOOLS NODE_MAJOR BACKUP_REPO BACKUP_PATHS BACKUP_TIME BACKUP_KEEP"
 for _s in $SOURCES; do CONF_KEYS+=" SRC_$_s ROUTE_$_s"; done; unset _s
 
 # Answers of this run that are not saved
 ADMIN_KEYS="" ADMIN_PASSWORD="" ADMIN_PW_GENERATED=n DEPLOY_KEYS="" NEW_HOSTNAME="" UFW_RESET=n
-MIRROR_PASSWORD_NEW="" PRO_TOKEN=""
+MIRROR_PASSWORD_NEW="" PRO_TOKEN="" NEW_TOOLS=""
 PW_GENERATED=n
 REFRESH_FOR=""
 KEYS_OUT=""
@@ -94,7 +96,7 @@ defaults() { # fill every setting that is still empty
   : "${REPO_UBUNTU:=ubuntu}" "${REPO_UBUNTU_SECURITY:=ubuntu-security}" "${REPO_UBUNTU_PORTS:=ubuntu-ports}"
   : "${REPO_DEBIAN:=debian}" "${REPO_DEBIAN_SECURITY:=debian-security}"
   : "${REPO_DOCKER_APT:=docker-apt}" "${REPO_GRAFANA_APT:=grafana-apt}" "${REPO_NODESOURCE_APT:=nodesource-apt}"
-  : "${REPO_NPM:=npm-proxy}" "${REPO_PYPI:=pypi-proxy}" "${REPO_GO:=go-proxy}" "${REPO_GITHUB:=github-proxy}"
+  : "${REPO_NPM:=npm-proxy}" "${REPO_PYPI:=pypi-proxy}" "${REPO_GO:=go-proxy}" "${REPO_GODL:=go-dl}" "${REPO_GITHUB:=github-proxy}"
   [[ -n $MIRROR_DOCKER_REGISTRY ]] || MIRROR_DOCKER_REGISTRY=$(mirror_host)
   local s v
   for s in $SOURCES; do v="SRC_$s"; [[ -n ${!v} ]] || printf -v "$v" auto; done
@@ -610,7 +612,7 @@ source_label() {
     apt) printf 'OS packages (apt)' ;; ntp) printf 'time (NTP)' ;; dockerhub) printf 'Docker Hub images' ;;
     ghcr) printf 'ghcr.io images' ;; dockerapt) printf "Docker's apt repo" ;; grafanaapt) printf "Grafana's apt repo" ;;
     nodesource) printf 'NodeSource apt repo' ;; npm) printf 'npm registry' ;; pypi) printf 'PyPI' ;;
-    go) printf 'Go modules' ;; github) printf 'GitHub downloads' ;; *) printf '%s' "$1" ;;
+    go) printf 'Go modules' ;; godl) printf 'Go toolchain downloads' ;; github) printf 'GitHub downloads' ;; *) printf '%s' "$1" ;;
   esac
 }
 route_of() { local v="ROUTE_$1"; printf '%s' "${!v:-unset}"; }
@@ -625,6 +627,7 @@ direct_url() { # the public address a source is checked against
     dockerapt) printf 'https://download.docker.com/linux/' ;; grafanaapt) printf 'https://apt.grafana.com/' ;;
     nodesource) printf 'https://deb.nodesource.com/' ;; npm) printf 'https://registry.npmjs.org/' ;;
     pypi) printf 'https://pypi.org/simple/pip/' ;; go) printf 'https://proxy.golang.org/golang.org/x/text/@v/list' ;;
+    godl) printf 'https://dl.google.com/go/go1.22.0.linux-amd64.tar.gz.sha256' ;;
     github) printf 'https://github.com/' ;;
   esac
 }
@@ -640,6 +643,7 @@ mirror_url_of() { # where a source lives on the mirror
     npm) printf '%s/repository/%s/' "$b" "$REPO_NPM" ;;
     pypi) printf '%s/repository/%s/simple/pip/' "$b" "$REPO_PYPI" ;;
     go) printf '%s/repository/%s/golang.org/x/text/@v/list' "$b" "$REPO_GO" ;;
+    godl) printf '%s/repository/%s/go/go1.22.0.linux-amd64.tar.gz.sha256' "$b" "$REPO_GODL" ;;
     github) printf '%s/repository/%s/' "$b" "$REPO_GITHUB" ;;
   esac
 }
@@ -849,8 +853,8 @@ mirror_show() {
   local s v
   printf '    Mirror:   %s   login: %s\n' "$(mirror_base)" "${MIRROR_USER:-(none)}"
   printf '    Repos:    apt %s/%s (ports: %s), debian %s/%s\n' "$REPO_UBUNTU" "$REPO_UBUNTU_SECURITY" "$REPO_UBUNTU_PORTS" "$REPO_DEBIAN" "$REPO_DEBIAN_SECURITY"
-  printf '              docker-apt %s, grafana-apt %s, nodesource %s, npm %s, pypi %s, go %s, github %s\n' \
-    "$REPO_DOCKER_APT" "$REPO_GRAFANA_APT" "$REPO_NODESOURCE_APT" "$REPO_NPM" "$REPO_PYPI" "$REPO_GO" "$REPO_GITHUB"
+  printf '              docker-apt %s, grafana-apt %s, nodesource %s, npm %s, pypi %s, go %s, go-dl %s, github %s\n' \
+    "$REPO_DOCKER_APT" "$REPO_GRAFANA_APT" "$REPO_NODESOURCE_APT" "$REPO_NPM" "$REPO_PYPI" "$REPO_GO" "$REPO_GODL" "$REPO_GITHUB"
   printf '              docker registry %s\n' "$MIRROR_DOCKER_REGISTRY"
   printf '    NTP:      %s\n' "${NTP_SERVERS:-(public pools only)}"
   printf '    %-22s %-8s %s\n' SOURCE WANTED IN-USE
@@ -870,7 +874,7 @@ mirror_prompt() {
   fi
   info "Repository names on the mirror ('-' keeps nothing; Enter keeps the shown value):"
   for k in REPO_UBUNTU REPO_UBUNTU_SECURITY REPO_UBUNTU_PORTS REPO_DEBIAN REPO_DEBIAN_SECURITY REPO_DOCKER_APT \
-           REPO_GRAFANA_APT REPO_NODESOURCE_APT REPO_NPM REPO_PYPI REPO_GO REPO_GITHUB; do
+           REPO_GRAFANA_APT REPO_NODESOURCE_APT REPO_NPM REPO_PYPI REPO_GO REPO_GODL REPO_GITHUB; do
     prompt "$k" "  $k" "${!k}" valid_repo_name
   done
   prompt MIRROR_DOCKER_REGISTRY "  Docker registry host on the mirror" "$MIRROR_DOCKER_REGISTRY" valid_host_list
@@ -885,12 +889,30 @@ valid_src_mode() { [[ $1 =~ ^(auto|direct|mirror|none)$ ]] || { warn "Use auto, 
 
 # Re-apply every source in use (apt and NTP now; the tools add theirs in later versions)
 mirror_apply_all() {
+  local s
   step "Package sources"
   resolve_apt
   run "Refreshing package lists" apt_get update
   if [[ -f /etc/chrony/chrony.conf ]]; then step "Time sync"; apply_time_sync; fi
-  ok "Sources: apt $(route_of apt), ntp $(route_of ntp)"
+  step "Tool sources"
+  # every source a tool already uses is decided again and re-written where it is read
+  for s in dockerhub dockerapt grafanaapt nodesource npm pypi go godl github; do
+    [[ $(route_of "$s") == unset ]] && continue
+    RECHECK=y need_source "$s"
+  done
+  [[ -f /etc/apt/sources.list.d/server-setup-docker.sources ]] && apt_repo dockerapt docker "https://download.docker.com/linux/$OS_ID" "$OS_CODENAME" stable "https://download.docker.com/linux/$OS_ID/gpg"
+  [[ -f /etc/apt/sources.list.d/server-setup-nodesource.sources ]] && apt_repo nodesource nodesource "https://deb.nodesource.com/node_${NODE_MAJOR:-24}.x" nodistro main https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key
+  [[ -f /etc/apt/sources.list.d/server-setup-grafana.sources ]] && apt_repo grafanaapt grafana https://apt.grafana.com stable main https://apt.grafana.com/gpg.key
+  apt_auth_sync
+  render_client_mirrors
+  if os_installed docker-ce; then
+    render_daemon_json "$(docker_swarm_active && echo y || echo n)" >/etc/docker/daemon.json
+    systemctl restart docker; docker_login_mirror
+  fi
+  local line=""; for s in $SOURCES; do [[ $(route_of "$s") != unset ]] && line+="$s $(route_of "$s"), "; done
+  ok "Sources: ${line%, }"
 }
+docker_swarm_active() { [[ $(docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null) == active ]]; }
 
 # ----------------------------------------------------------------------------
 # Base role: update, users, firewall, hardening, long-uptime tuning
@@ -995,6 +1017,8 @@ apply_firewall() { # apply_firewall <ssh port>...
   for spec in $OPEN_PORTS; do
     [[ $spec == */* ]] || spec="$spec/tcp"
     ufw allow "$spec" comment 'server-setup open port' >>"$LOG_FILE"
+    # containers that publish this port are reachable too (Docker's ports pass DOCKER-USER)
+    if os_installed docker-ce; then ufw route allow proto "${spec#*/}" from any to any port "${spec%/*}" >>"$LOG_FILE" 2>&1 || true; fi
   done
   ufw logging low >>"$LOG_FILE" 2>&1 || true
   ufw --force enable >>"$LOG_FILE"
@@ -1496,6 +1520,526 @@ maybe_use_tmux() {
 }
 
 # ----------------------------------------------------------------------------
+# Sources in use by tools: decided the first time a tool needs one (direct first, then the
+# mirror), then written where that ecosystem reads it.
+# ----------------------------------------------------------------------------
+source_direct_ok() { http_ok "$(http_code "$(direct_url "$1")")"; }
+source_mirror_ok() { # does the mirror serve this source (with the login, if any)
+  local u code netrc args=()
+  u=$(mirror_url_of "$1"); [[ -n $u ]] || return 1
+  netrc=$(mktemp); if mirror_netrc "$netrc"; then args=(--netrc-file "$netrc"); fi
+  code=$(http_code "$u" "${args[@]}"); rm -f "$netrc"
+  [[ $code =~ ^(2..|3..)$ ]] && return 0
+  [[ $1 == dockerhub && $code == 401 ]]   # a registry always answers 401 before its token dance
+}
+# need_source <name> - make sure <name> has a route (direct|mirror), deciding it if needed
+need_source() {
+  local s=$1 v="SRC_$1" r="ROUTE_$1" cur
+  cur=${!r}
+  case ${!v} in
+    direct|mirror) printf -v "$r" '%s' "${!v}" ;;
+    none) die "$(source_label "$s") is set to 'none' - change it: server-setup mirror set" ;;
+    *)
+      if [[ -z $cur || ${RECHECK:-n} == y ]]; then
+        if source_direct_ok "$s"; then printf -v "$r" direct
+        elif source_mirror_ok "$s"; then printf -v "$r" mirror; note "$(source_label "$s"): not reachable directly - using the mirror."
+        else die "$(source_label "$s") is reachable neither directly nor on the mirror ($(mirror_url_of "$s")). Check: server-setup mirror test"
+        fi
+      fi ;;
+  esac
+  save_config
+}
+is_mirror() { [[ $(route_of "$1") == mirror ]]; }
+
+# fetch <source> <url-path-or-full-url> <out> - a download through the source's route.
+# direct: the URL as given; mirror: the same path under the source's mirror repository.
+fetch() {
+  local s=$1 url=$2 out=$3 netrc args=() rc=0
+  need_source "$s"
+  if is_mirror "$s"; then
+    url="$(mirror_base)/repository/$(mirror_repo_of "$s")/${url#*://*/}"
+    netrc=$(mktemp); if mirror_netrc "$netrc"; then args=(--netrc-file "$netrc"); fi
+  fi
+  printf '\n$ fetch %s\n' "$url" >>"$LOG_FILE"
+  curl -fsSL --retry 2 --connect-timeout 15 -o "$out" "${args[@]}" "$url" 2>>"$LOG_FILE" || rc=$?
+  [[ -n ${netrc-} ]] && rm -f "$netrc"
+  (( rc == 0 )) || die "Download failed: $url (see $LOG_FILE)"
+}
+mirror_repo_of() {
+  case $1 in
+    dockerapt) printf '%s' "$REPO_DOCKER_APT" ;; grafanaapt) printf '%s' "$REPO_GRAFANA_APT" ;;
+    nodesource) printf '%s' "$REPO_NODESOURCE_APT" ;; npm) printf '%s' "$REPO_NPM" ;; pypi) printf '%s' "$REPO_PYPI" ;;
+    go) printf '%s' "$REPO_GO" ;; github) printf '%s' "$REPO_GITHUB" ;; godl) printf '%s' "$REPO_GODL" ;;
+  esac
+}
+
+# apt credentials for every apt-type source that uses the mirror (root-only file)
+apt_auth_sync() {
+  local s use=n
+  for s in apt dockerapt grafanaapt nodesource; do is_mirror "$s" && use=y; done
+  install -d -m 755 /etc/apt/auth.conf.d
+  if [[ $use == y && -n $(apt_auth_render) ]]; then ( umask 077; apt_auth_render >"$APT_AUTH_FILE" ); else rm -f "$APT_AUTH_FILE"; fi
+}
+
+# apt_repo <source> <name> <direct-base-url> <suite> <components> <key-url>
+# A third-party apt repository, from its own server or the mirror (a proxy of that server).
+apt_repo() {
+  local s=$1 name=$2 base=$3 suite=$4 comps=$5 keyurl=$6 uri key tmp
+  need_source "$s"
+  key="/etc/apt/keyrings/server-setup-$name.gpg"
+  if is_mirror "$s"; then uri="$(mirror_base)/repository/$(mirror_repo_of "$s")/${base#*://*/}"; uri=${uri%/}; else uri=${base%/}; fi
+  install -d -m 755 /etc/apt/keyrings
+  tmp=$(mktemp)
+  fetch "$s" "$keyurl" "$tmp"
+  if grep -q 'BEGIN PGP' "$tmp"; then gpg --batch --yes --dearmor -o "$key" "$tmp"; else install -m 644 "$tmp" "$key"; fi
+  chmod 644 "$key"; rm -f "$tmp"
+  printf '# Managed by server-setup (%s)\nTypes: deb\nURIs: %s\nSuites: %s\nComponents: %s\nSigned-By: %s\n' \
+    "$(route_of "$s")" "$uri" "$suite" "$comps" "$key" >"/etc/apt/sources.list.d/server-setup-$name.sources"
+  apt_auth_sync
+  run "Refreshing package lists" apt_get update
+}
+
+# Language package managers: written system-wide, only when that source uses the mirror
+render_client_mirrors() {
+  local b; b=$(mirror_base)
+  if [[ $(route_of npm) == mirror ]]; then
+    printf '# Managed by server-setup: npm through the mirror\nregistry=%s/repository/%s/\n' "$b" "$REPO_NPM" >/etc/npmrc
+  elif [[ -f /etc/npmrc ]] && grep -q 'server-setup' /etc/npmrc; then rm -f /etc/npmrc; fi
+  if [[ $(route_of pypi) == mirror ]]; then
+    printf '# Managed by server-setup: PyPI through the mirror\n[global]\nindex-url = %s/repository/%s/simple\n' "$b" "$REPO_PYPI" >/etc/pip.conf
+  elif [[ -f /etc/pip.conf ]] && grep -q 'server-setup' /etc/pip.conf; then rm -f /etc/pip.conf; fi
+  {
+    printf '# Managed by server-setup: download sources for language tools\n'
+    if [[ $(route_of pypi) == mirror ]]; then printf 'export UV_DEFAULT_INDEX=%s/repository/%s/simple\nexport PIP_INDEX_URL=%s/repository/%s/simple\n' "$b" "$REPO_PYPI" "$b" "$REPO_PYPI"; fi
+    if [[ $(route_of npm) == mirror ]]; then printf 'export NPM_CONFIG_REGISTRY=%s/repository/%s/\n' "$b" "$REPO_NPM"; fi
+    if [[ $(route_of go) == mirror ]]; then
+      # the checksum database (sum.golang.org) is not proxied: modules are trusted from the mirror
+      printf 'export GOPROXY=%s/repository/%s/\nexport GOSUMDB=off\n' "$b" "$REPO_GO"
+    fi
+  } >/etc/profile.d/90-server-setup-sources.sh
+  if [[ -n $MIRROR_USER && -n $(secret_get mirror-password || true) ]] && \
+     [[ $(route_of npm) == mirror || $(route_of pypi) == mirror || $(route_of go) == mirror ]]; then
+    note "Mirror login is NOT written into npm/pip/Go settings (they are readable by every user). Allow anonymous read on those Nexus proxies, or each app user logs in itself."
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# Docker: Docker's own packages, logs capped, published ports filtered by ufw
+# ----------------------------------------------------------------------------
+render_daemon_json() { # render_daemon_json [swarm:y|n]
+  local mirrors=""
+  if [[ $(route_of dockerhub) == mirror ]]; then mirrors=$(printf '  "registry-mirrors": ["https://%s"],\n' "$MIRROR_DOCKER_REGISTRY"); fi
+  cat <<EOF
+{
+${mirrors}  "log-driver": "local",
+  "log-opts": { "max-size": "20m", "max-file": "5" },
+  $([[ ${1:-n} == y ]] && echo '"live-restore": false' || echo '"live-restore": true'),
+  "userland-proxy": false,
+  "default-ulimits": { "nofile": { "Name": "nofile", "Soft": 65536, "Hard": 1048576 } }
+}
+EOF
+}
+
+# Docker publishes ports with its own iptables rules, past ufw. These rules (in DOCKER-USER)
+# let containers talk out and to each other, and let in from outside only what
+# `server-setup firewall allow` opened (ufw route rules) - everything else is dropped.
+render_ufw_docker() {
+  cat <<'EOF'
+# BEGIN server-setup docker
+*filter
+:ufw-user-forward - [0:0]
+:server-setup-docker-deny - [0:0]
+:DOCKER-USER - [0:0]
+-F DOCKER-USER
+-F server-setup-docker-deny
+-A DOCKER-USER -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
+-A DOCKER-USER -i docker0 -j RETURN
+-A DOCKER-USER -i br-+ -j RETURN
+-A DOCKER-USER -i docker_gwbridge -j RETURN
+-A DOCKER-USER -j ufw-user-forward
+-A DOCKER-USER -m conntrack --ctstate NEW -j server-setup-docker-deny
+-A DOCKER-USER -j RETURN
+-A server-setup-docker-deny -m limit --limit 3/min --limit-burst 10 -j LOG --log-prefix "[UFW DOCKER BLOCK] "
+-A server-setup-docker-deny -j DROP
+COMMIT
+# END server-setup docker
+EOF
+}
+apply_ufw_docker() {
+  local f=/etc/ufw/after.rules tmp
+  [[ -f $f ]] || return 0
+  backup_file "$f"
+  tmp=$(mktemp)
+  awk '/^# BEGIN server-setup docker$/ {skip = 1} !skip {print} /^# END server-setup docker$/ {skip = 0}' "$f" >"$tmp"
+  render_ufw_docker >>"$tmp"
+  install -m 640 "$tmp" "$f"; rm -f "$tmp"
+  ufw reload >>"$LOG_FILE" 2>&1 || die "ufw did not accept the Docker rules (see $LOG_FILE)."
+  step_firewall   # adds the route rules for the open ports, now that Docker is here
+}
+
+install_docker() { # install_docker [swarm:y|n]
+  local p
+  if ! os_installed docker-ce; then
+    apt_repo dockerapt docker "https://download.docker.com/linux/$OS_ID" "$OS_CODENAME" stable "https://download.docker.com/linux/$OS_ID/gpg"
+    # Ubuntu's own docker.io would conflict
+    for p in docker.io docker-doc docker-compose podman-docker containerd runc; do os_installed "$p" && run "Removing $p" apt_get remove "$p"; done
+    os_install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  fi
+  need_source dockerhub
+  install -d /etc/docker
+  render_daemon_json "${1:-n}" >/etc/docker/daemon.json.new
+  if ! cmp -s /etc/docker/daemon.json.new /etc/docker/daemon.json 2>/dev/null; then
+    mv -f /etc/docker/daemon.json.new /etc/docker/daemon.json
+    systemctl enable docker >>"$LOG_FILE" 2>&1; systemctl restart docker
+  else rm -f /etc/docker/daemon.json.new; fi
+  docker_login_mirror
+  apply_ufw_docker
+  if [[ -n $ADMIN_USER ]] && id "$ADMIN_USER" &>/dev/null; then usermod -aG docker "$ADMIN_USER"; fi
+  note "Docker $(docker version --format '{{.Server.Version}}' 2>/dev/null): logs capped (20 MB x 5 per container), images $(route_of dockerhub)$([[ $(route_of dockerhub) == mirror ]] && echo " via $MIRROR_DOCKER_REGISTRY"); published ports pass only what 'server-setup firewall allow' opens."
+  note "  The docker group is root-equivalent: only $ADMIN_USER is in it."
+}
+docker_login_mirror() {
+  [[ $(route_of dockerhub) == mirror ]] || return 0
+  local pw; pw=$(secret_get mirror-password || true)
+  if [[ -n $MIRROR_USER && -n $pw ]]; then
+    printf '%s' "$pw" | docker login --username "$MIRROR_USER" --password-stdin "$MIRROR_DOCKER_REGISTRY" >>"$LOG_FILE" 2>&1 \
+      || warn "docker login to $MIRROR_DOCKER_REGISTRY failed (see $LOG_FILE)."
+    note "Docker: Docker Hub goes through $MIRROR_DOCKER_REGISTRY. 'registry-mirrors' can't send a login: if the Nexus proxy needs one, pull as $MIRROR_DOCKER_REGISTRY/library/<image> (logged in), or allow anonymous pull on it."
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# Tools catalog (app role): nothing is installed unless asked for
+# ----------------------------------------------------------------------------
+readonly TOOL_CATALOG="docker|Docker CE + compose + buildx (Docker's apt repo)
+node|Node.js LTS from NodeSource (--version 22|24...)
+python|Python 3 + venv + pip + pipx + uv
+go|Go toolchain in /usr/local/go (--version 1.x.y)
+nginx|nginx web server / reverse proxy
+caddy|Caddy web server with automatic HTTPS
+certbot|Let's Encrypt certificates (certbot + nginx plugin)
+postgresql|PostgreSQL server (the OS's version)
+postgresql-client|PostgreSQL client tools only
+redis|Redis server (localhost only)
+restic|restic backups (then: server-setup backup init)
+apt:<pkg>|any package from the OS repositories
+url:<https://...tar.gz>|a tarball, unpacked into --prefix (default /opt/<name>)"
+
+TOOL_VERSION="" TOOL_PREFIX="" TOOL_SHA256=""
+cmd_tools() {
+  local action=${1-} names=() a; if (( $# > 0 )); then shift; fi
+  TOOL_VERSION="" TOOL_PREFIX="" TOOL_SHA256=""
+  while (( $# > 0 )); do
+    case $1 in
+      --version) TOOL_VERSION=${2-}; shift ;; --version=*) TOOL_VERSION=${1#*=} ;;
+      --prefix) TOOL_PREFIX=${2-}; shift ;; --prefix=*) TOOL_PREFIX=${1#*=} ;;
+      --sha256) TOOL_SHA256=${2-}; shift ;; --sha256=*) TOOL_SHA256=${1#*=} ;;
+      -*) die "Unknown option $1" ;;
+      *) names+=("$1") ;;
+    esac
+    shift
+  done
+  case $action in
+    list|"") tools_list ;;
+    install)
+      (( ${#names[@]} > 0 )) || die "usage: server-setup tools install <tool>... [--version V] [--prefix DIR]   (list: server-setup tools list)"
+      local failed=()
+      for a in "${names[@]}"; do ( install_tool "$a" ) || failed+=("$a"); done
+      (( ${#failed[@]} == 0 )) || die "Not installed: ${failed[*]} (details above and in $LOG_FILE)"
+      ok "Installed: ${names[*]}" ;;
+    remove)
+      (( ${#names[@]} > 0 )) || die "usage: server-setup tools remove <tool>..."
+      for a in "${names[@]}"; do remove_tool "$a"; done ;;
+    *) die "usage: server-setup tools list | install <tool>... [--version V] [--prefix DIR] [--sha256 H] | remove <tool>..." ;;
+  esac
+}
+tools_list() {
+  local name desc state
+  printf '    %-26s %-10s %s\n' TOOL STATE ""
+  while IFS='|' read -r name desc; do
+    state=-; if tool_installed "$name"; then state=installed; fi
+    printf '    %-26s %-10s %s\n' "$name" "$state" "$desc"
+  done <<<"$TOOL_CATALOG"
+  [[ -z $TOOLS ]] || info "Installed with server-setup: $TOOLS"
+}
+tool_installed() {
+  case $1 in
+    docker) os_installed docker-ce ;; node) command -v node >/dev/null ;; python) command -v uv >/dev/null || os_installed python3-venv ;;
+    go) [[ -x /usr/local/go/bin/go ]] ;; postgresql) os_installed postgresql ;; redis) os_installed redis-server ;;
+    *:*) return 1 ;; *) os_installed "$1" ;;
+  esac
+}
+tool_record() { TOOLS=$(uniq_words $TOOLS "$1"); save_config; }
+
+install_tool() {
+  local t=$1
+  case $t in
+    docker) install_docker n ;;
+    node)
+      local major=${TOOL_VERSION:-${NODE_MAJOR:-24}}; major=${major%%.*}
+      [[ $major =~ ^[0-9]{2}$ ]] || die "Node --version must be a major version such as 22 or 24."
+      apt_repo nodesource nodesource "https://deb.nodesource.com/node_$major.x" nodistro main https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key
+      os_install nodejs
+      NODE_MAJOR=$major
+      need_source npm; render_client_mirrors
+      note "Node.js $(node --version 2>/dev/null) (NodeSource, $(route_of nodesource)); npm registry: $(route_of npm)." ;;
+    python)
+      os_install python3 python3-venv python3-pip pipx
+      need_source pypi; render_client_mirrors
+      if ! command -v uv >/dev/null; then
+        # uv for everyone, installed once into /usr/local (from PyPI - direct or the mirror)
+        local idx=()
+        if is_mirror pypi; then idx=(--index-url "$(mirror_base)/repository/$REPO_PYPI/simple"); fi
+        run "Installing uv" env PIPX_HOME=/opt/pipx PIPX_BIN_DIR=/usr/local/bin pipx install uv --pip-args="${idx[*]}"
+      fi
+      note "Python $(python3 --version 2>/dev/null | awk '{print $2}'), pipx, uv $(uv --version 2>/dev/null | awk '{print $2}'); PyPI: $(route_of pypi)." ;;
+    go) install_go ;;
+    nginx)
+      os_install nginx
+      printf '# Managed by server-setup\nserver_tokens off;\n' >/etc/nginx/conf.d/00-server-setup.conf
+      nginx -t >>"$LOG_FILE" 2>&1 && systemctl reload nginx
+      note "nginx $(nginx -v 2>&1 | awk -F/ '{print $2}'): version hidden. Open the ports: server-setup firewall allow 80 443" ;;
+    caddy)
+      pkg_available caddy || die "Caddy is not in this OS's repositories ($OS_ID $OS_VERSION)."
+      os_install caddy; note "Caddy $(caddy version 2>/dev/null | awk '{print $1}'). Open the ports: server-setup firewall allow 80 443" ;;
+    certbot)
+      os_install certbot
+      if os_installed nginx; then os_install python3-certbot-nginx; fi
+      note "certbot: certificates renew by themselves (certbot.timer). Needs internet to Let's Encrypt - not usable inside an internal network." ;;
+    postgresql)
+      os_install postgresql
+      note "PostgreSQL $(psql --version 2>/dev/null | awk '{print $3}'): listens on localhost only. Reach it from your PC with: ssh -L 5432:127.0.0.1:5432 <server>" ;;
+    postgresql-client) os_install postgresql-client ;;
+    redis)
+      os_install redis-server
+      sed -i -E 's/^supervised .*/supervised systemd/' /etc/redis/redis.conf
+      grep -qE '^bind 127\.0\.0\.1' /etc/redis/redis.conf || note "redis: check 'bind' in /etc/redis/redis.conf - it should stay on localhost."
+      systemctl restart redis-server
+      note "Redis $(redis-server --version 2>/dev/null | grep -oE 'v=[0-9.]+' | cut -d= -f2): localhost only." ;;
+    restic) os_install restic; note "restic $(restic version 2>/dev/null | awk '{print $2}'). Set up backups: server-setup backup init" ;;
+    apt:*)
+      local p=${t#apt:}
+      [[ $p =~ ^[a-z0-9][a-z0-9+.-]+$ ]] || die "'$p' is not a package name."
+      pkg_available "$p" || die "No package '$p' in the configured repositories."
+      os_install "$p" ;;
+    url:*) install_tarball "${t#url:}" ;;
+    *) die "Unknown tool '$t' (see: server-setup tools list)." ;;
+  esac
+  tool_record "$t"
+}
+remove_tool() {
+  local t=$1
+  case $t in
+    docker) die "Removing Docker deletes every container's runtime - do it by hand if you mean it: apt purge docker-ce docker-ce-cli containerd.io" ;;
+    node) run "Removing Node.js" apt_get purge nodejs; rm -f /etc/apt/sources.list.d/server-setup-nodesource.sources ;;
+    go) rm -rf /usr/local/go; rm -f /etc/profile.d/90-server-setup-go.sh ;;
+    python) run "Removing uv" env PIPX_HOME=/opt/pipx PIPX_BIN_DIR=/usr/local/bin pipx uninstall uv || true ;;
+    redis) run "Removing Redis" apt_get purge redis-server ;;
+    postgresql) die "Removing PostgreSQL can delete databases - do it by hand: apt purge postgresql" ;;
+    apt:*) run "Removing ${t#apt:}" apt_get purge "${t#apt:}" ;;
+    url:*) die "Remove the unpacked directory by hand." ;;
+    *) run "Removing $t" apt_get purge "$t" ;;
+  esac
+  TOOLS=$(printf '%s\n' $TOOLS | awk -v x="$t" '$0 != x' | xargs); save_config
+  ok "Removed $t."
+}
+
+install_go() {
+  local ver=${TOOL_VERSION-} arch file tmp want
+  arch=$OS_ARCH; [[ $arch == amd64 || $arch == arm64 ]] || die "No Go build for $arch."
+  if [[ -z $ver ]]; then
+    ver=$(curl -fsS -m 15 'https://go.dev/VERSION?m=text' 2>/dev/null | head -n1 || true)
+    [[ -n $ver ]] || die "go.dev is not reachable - give the version: server-setup tools install go --version 1.25.4"
+  fi
+  ver=go${ver#go}
+  [[ $ver =~ ^go[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || die "'$ver' is not a Go version."
+  if [[ -x /usr/local/go/bin/go && $(/usr/local/go/bin/go version | awk '{print $3}') == "$ver" ]]; then note "Go $ver already installed."; return 0; fi
+  file="$ver.linux-$arch.tar.gz"
+  tmp=$(mktemp -d)
+  fetch godl "https://dl.google.com/go/$file" "$tmp/$file"
+  fetch godl "https://dl.google.com/go/$file.sha256" "$tmp/sum"
+  want=$(tr -d ' \n' <"$tmp/sum")
+  [[ $want =~ ^[0-9a-f]{64}$ ]] || die "No checksum published for $file."
+  printf '%s  %s\n' "$want" "$tmp/$file" | sha256sum -c --quiet - || { rm -rf "$tmp"; die "Checksum mismatch for $file - not installed."; }
+  rm -rf /usr/local/go; tar -C /usr/local -xzf "$tmp/$file"; rm -rf "$tmp"
+  printf '# Managed by server-setup\ncase ":$PATH:" in *:/usr/local/go/bin:*) ;; *) PATH="/usr/local/go/bin:$PATH" ;; esac\n' >/etc/profile.d/90-server-setup-go.sh
+  need_source go; render_client_mirrors
+  note "Go $ver in /usr/local/go (checksum verified; download $(route_of godl), modules $(route_of go))."
+}
+
+install_tarball() { # a release tarball: github.com URLs go through the GitHub source's route
+  local url=$1 name prefix tmp file
+  [[ $url =~ ^https://[A-Za-z0-9.-]+/[^[:space:]]+\.(tar\.gz|tgz|tar\.xz|tar\.zst|zip)$ ]] || die "Give an https URL of a .tar.gz/.tgz/.tar.xz/.zip file."
+  file=${url##*/}; name=${file%%[-_.][0-9v]*}; name=${name%%.*}
+  prefix=${TOOL_PREFIX:-/opt/$name}
+  [[ $prefix == /* && $prefix != / && $prefix != *..* ]] || die "--prefix must be an absolute directory."
+  tmp=$(mktemp -d)
+  if [[ $url == https://github.com/* || $url == https://objects.githubusercontent.com/* ]]; then fetch github "$url" "$tmp/$file"
+  else
+    printf '\n$ download %s\n' "$url" >>"$LOG_FILE"
+    curl -fsSL --retry 2 -o "$tmp/$file" "$url" 2>>"$LOG_FILE" || die "Download failed: $url"
+  fi
+  if [[ -n $TOOL_SHA256 ]]; then printf '%s  %s\n' "$TOOL_SHA256" "$tmp/$file" | sha256sum -c --quiet - || { rm -rf "$tmp"; die "Checksum mismatch."; }
+  else warn "No --sha256 given: $file is not verified."; fi
+  install -d -m 755 "$prefix"
+  case $file in
+    *.zip) command -v unzip >/dev/null || os_install unzip; unzip -oq "$tmp/$file" -d "$prefix" ;;
+    *) tar -C "$prefix" -xf "$tmp/$file" ;;
+  esac
+  rm -rf "$tmp"
+  note "Unpacked $file into $prefix."
+}
+
+# ----------------------------------------------------------------------------
+# Backups (restic): any restic repository - a local disk, SFTP, S3 / MinIO
+# ----------------------------------------------------------------------------
+cmd_backup() {
+  local action=${1-}; if (( $# > 0 )); then shift; fi
+  case $action in
+    init)
+      need_tty
+      command -v restic >/dev/null || install_tool restic
+      prompt BACKUP_REPO "restic repository (e.g. /mnt/backup, sftp:user@host:/backups, s3:https://minio.local/bucket)" "${BACKUP_REPO:-}" accept_any
+      prompt BACKUP_PATHS "Paths to back up (space-separated)" "${BACKUP_PATHS:-/etc /srv /var/lib/postgresql /root}" accept_any
+      prompt BACKUP_TIME "Daily backup time (HH:MM)" "${BACKUP_TIME:-02:30}" valid_time
+      prompt BACKUP_KEEP "Keep (restic forget policy)" "${BACKUP_KEEP:---keep-daily 7 --keep-weekly 5 --keep-monthly 12}" accept_any
+      local pw env=""
+      pw=$(secret_get restic-password || true)
+      if [[ -z $pw ]]; then pw=$(gen_password 32); secret_set restic-password "$pw"; note_cred root "restic password" "$pw"; fi
+      if [[ $BACKUP_REPO == s3:* ]]; then
+        local ak sk
+        prompt ak "S3 access key" "" accept_any
+        printf '%s?%s S3 secret key: ' "$C_C" "$C_0" >/dev/tty; IFS= read -rs sk </dev/tty; printf '\n' >/dev/tty
+        env=$(printf 'AWS_ACCESS_KEY_ID=%s\nAWS_SECRET_ACCESS_KEY=%s\n' "$ak" "$sk")
+      fi
+      ( umask 077; printf 'RESTIC_REPOSITORY=%s\nRESTIC_PASSWORD_FILE=%s\n%s\n' "$BACKUP_REPO" "$SECRETS_DIR/restic-password" "$env" >"$SECRETS_DIR/restic.env" )
+      save_config
+      backup_units
+      if ! backup_restic cat config >/dev/null 2>&1; then run "Creating the restic repository" backup_restic init; fi
+      ok "Backups: daily at $BACKUP_TIME to $BACKUP_REPO (paths: $BACKUP_PATHS)."
+      warn "Keep the restic password somewhere safe outside this server - without it the backups can't be read: $CRED_DIR/root.txt" ;;
+    run) run "Backing up" systemctl start --wait server-setup-backup.service; backup_restic snapshots --latest 3 ;;
+    status|"") [[ -n $BACKUP_REPO ]] || { info "No backups configured: server-setup backup init"; return 0; }
+      info "Repository: $BACKUP_REPO   paths: $BACKUP_PATHS   daily at $BACKUP_TIME"
+      systemctl list-timers server-setup-backup.timer --no-pager 2>/dev/null | sed 's/^/    /' | head -3
+      backup_restic snapshots --latest 5 2>&1 | sed 's/^/    /' ;;
+    list) backup_restic snapshots ;;
+    *) die "usage: server-setup backup init|run|status|list   (restore: restic with the env in $SECRETS_DIR/restic.env)" ;;
+  esac
+}
+backup_restic() { ( set -a; . "$SECRETS_DIR/restic.env"; set +a; restic "$@" ); }
+backup_units() {
+  install -d -m 755 "$LIB_DIR"
+  cat >"$LIB_DIR/backup" <<EOF
+#!/bin/bash
+# Managed by server-setup: daily restic backup, then forget/prune by the policy
+set -euo pipefail
+set -a; . $SECRETS_DIR/restic.env; set +a
+restic backup --one-file-system --exclude-caches $BACKUP_PATHS
+restic forget --prune $BACKUP_KEEP
+restic check --read-data-subset=1%
+EOF
+  chmod 700 "$LIB_DIR/backup"
+  cat >/etc/systemd/system/server-setup-backup.service <<EOF
+# Managed by server-setup
+[Unit]
+Description=Backup with restic (server-setup)
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+Nice=10
+IOSchedulingClass=idle
+ExecStart=$LIB_DIR/backup
+EOF
+  cat >/etc/systemd/system/server-setup-backup.timer <<EOF
+# Managed by server-setup
+[Unit]
+Description=Daily backup (server-setup)
+[Timer]
+OnCalendar=*-*-* $BACKUP_TIME:00
+RandomizedDelaySec=10min
+Persistent=true
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now server-setup-backup.timer >>"$LOG_FILE" 2>&1
+}
+
+# ----------------------------------------------------------------------------
+# App services: every app runs as its own system user, in /srv/<name>, under systemd
+# with a hardened sandbox; logs go to the journal (capped).
+# ----------------------------------------------------------------------------
+render_app_unit() { # render_app_unit <name> <exec> <dir> <port>
+  cat <<EOF
+# Managed by server-setup (server-setup apps ...)
+[Unit]
+Description=App $1 (server-setup)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+User=$1
+Group=$1
+WorkingDirectory=$3
+EnvironmentFile=-/etc/server-setup/apps/$1.env
+ExecStart=$2
+Restart=always
+RestartSec=3
+LimitNOFILE=65536
+# sandbox: the app sees the system read-only, writes only its own directory
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=$3
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+$([[ ${4:-0} -gt 0 && ${4:-0} -lt 1024 ]] && printf 'AmbientCapabilities=CAP_NET_BIND_SERVICE\n')
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+cmd_apps() {
+  local action=${1-} name="" exec="" port=0 a; if (( $# > 0 )); then shift; fi
+  while (( $# > 0 )); do
+    case $1 in --exec) exec=${2-}; shift ;; --port) port=${2-0}; shift ;; -*) die "Unknown option $1" ;; *) name=$1 ;; esac
+    shift
+  done
+  case $action in
+    list|"")
+      systemctl list-units --all --plain --no-legend 'app-*.service' 2>/dev/null | awk '{printf "    %-30s %s %s\n", $1, $3, $4}'
+      [[ -n $(systemctl list-units --all --plain --no-legend 'app-*.service' 2>/dev/null) ]] || info "No apps yet: server-setup apps add <name> --exec \"<command>\"" ;;
+    add)
+      [[ $name =~ ^[a-z][a-z0-9-]{1,30}$ ]] || die "usage: server-setup apps add <name> --exec \"/srv/<name>/bin/app --flag\" [--port N]"
+      [[ -n $exec && $exec == /* ]] || die "--exec needs the full command, starting with an absolute path."
+      [[ $port =~ ^[0-9]{1,5}$ ]] || die "--port must be a number."
+      id "$name" &>/dev/null || useradd --system --home-dir "/srv/$name" --shell /usr/sbin/nologin --user-group "$name"
+      install -d -m 750 -o "$name" -g "$name" "/srv/$name"
+      install -d -m 750 /etc/server-setup/apps
+      [[ -f /etc/server-setup/apps/$name.env ]] || install -m 640 -g "$name" /dev/null "/etc/server-setup/apps/$name.env"
+      render_app_unit "$name" "$exec" "/srv/$name" "$port" >"/etc/systemd/system/app-$name.service"
+      systemctl daemon-reload; systemctl enable "app-$name.service" >>"$LOG_FILE" 2>&1
+      ok "App $name: user $name, files in /srv/$name, settings (KEY=value) in /etc/server-setup/apps/$name.env"
+      info "Start it: sudo systemctl start app-$name   logs: journalctl -u app-$name -f"
+ ;;
+    remove)
+      [[ -n $name && -f /etc/systemd/system/app-$name.service ]] || die "No app '$name'."
+      systemctl disable --now "app-$name.service" >>"$LOG_FILE" 2>&1 || true
+      rm -f "/etc/systemd/system/app-$name.service"; systemctl daemon-reload
+      ok "App $name stopped and removed. Its files stay in /srv/$name and its user stays (userdel $name to remove)." ;;
+    *) die "usage: server-setup apps list | add <name> --exec CMD [--port N] | remove <name>" ;;
+  esac
+}
+
+# ----------------------------------------------------------------------------
 # Setup
 # ----------------------------------------------------------------------------
 collect_answers() {
@@ -1562,8 +2106,9 @@ collect_answers() {
   step "5/5  Extras"
   prompt_yn AUDITD "Record changes to accounts, sudo, SSH and the firewall (auditd)?" "$AUDITD"
   prompt_yn LYNIS "Run a Lynis security audit at the end (report only)?" "$LYNIS"
-  info "Roles available in this version: base (hardening). Tools, monitoring and Dokploy nodes come next."
-  ROLES=base
+  info "Nothing is installed beyond hardening unless you list it. Tools: docker node python go nginx"
+  info "caddy certbot postgresql postgresql-client redis restic, apt:<package> (later: server-setup tools install)."
+  prompt NEW_TOOLS "Tools to install now (space-separated, empty = none)" "" valid_tool_list
 
   step "Plan"
   info "OS:                  $OS_ID $OS_VERSION ($OS_CODENAME, $OS_ARCH)"
@@ -1574,6 +2119,18 @@ collect_answers() {
   info "Sources:             direct first, mirror $(mirror_base) as fallback${NTP_SERVERS:+; NTP $NTP_SERVERS}"
   info "Reboots:             $([[ $AUTO_REBOOT == y ]] && echo "automatic at $REBOOT_TIME when needed" || echo 'never automatic')"
   info "Extras:              auditd $AUDITD, Lynis $LYNIS${PRO_TOKEN:+, Ubuntu Pro + Livepatch}"
+  info "Tools:               ${NEW_TOOLS:-(none - hardening only)}"
+}
+valid_tool_list() {
+  local t
+  for t in $1; do
+    case $t in
+      docker|node|python|go|nginx|caddy|certbot|postgresql|postgresql-client|redis|restic) ;;
+      apt:*) [[ ${t#apt:} =~ ^[a-z0-9][a-z0-9+.-]+$ ]] || { warn "'$t' is not apt:<package>."; return 1; } ;;
+      *) warn "Unknown tool '$t'."; return 1 ;;
+    esac
+  done
+  return 0
 }
 valid_username_or_empty() { [[ -z $1 ]] || valid_username "$1"; }
 
@@ -1614,6 +2171,8 @@ cmd_setup() {
   try_step "Automatic security updates" apply_auto_updates
   if [[ -n $PRO_TOKEN ]]; then try_step "Ubuntu Pro and Livepatch" apply_ubuntu_pro; fi
   if [[ $AUDITD == y ]]; then try_step "auditd" apply_auditd; fi
+  local t
+  for t in $NEW_TOOLS; do try_step "Tool: $t" install_tool "$t"; done
   if step_ok "Users and SSH keys" && step_ok "Firewall"; then
     try_step "SSH hardening (ports $SSH_PORTS, auto-rollback)" ssh_apply $SSH_PORTS
   else
@@ -1687,6 +2246,7 @@ cmd_firewall() {
         OPEN_PORTS=$(printf '%s\n' $OPEN_PORTS | awk -v x="$spec" '$0 != x && $0 != x"/tcp"' | xargs)
         [[ $spec == */* ]] || spec="$spec/tcp"
         ufw delete allow "$spec" >>"$LOG_FILE" 2>&1 || true
+        ufw route delete allow proto "${spec#*/}" from any to any port "${spec%/*}" >>"$LOG_FILE" 2>&1 || true
       done
       save_config; ok "Open to everyone now: ${OPEN_PORTS:-(nothing but SSH)}" ;;
     ssh-from)
@@ -1827,6 +2387,14 @@ server-setup $SCRIPT_VERSION - hardened Ubuntu/Debian servers, online or interna
                                repository names, NTP servers, per-source mode. recheck: decide
                                again (e.g. after the server got or lost internet access).
 
+  tools list | install <tool>... [--version V] [--prefix DIR] [--sha256 H] | remove <tool>...
+                               Opt-in tools: docker, node, python, go, nginx, caddy, certbot,
+                               postgresql, redis, restic, apt:<pkg>, url:<tarball> - each
+                               downloaded directly or through the mirror.
+  apps list | add <name> --exec CMD [--port N] | remove <name>
+                               An app as a sandboxed systemd service with its own user (/srv/<name>).
+  backup init|run|status|list  Daily restic backups (local disk, SFTP, S3/MinIO).
+
   ssh [--ports "22 9011"]      Re-apply the SSH hardening or change its ports (auto-rollback).
   confirm                      Keep a pending SSH change now (otherwise it is kept on the
                                admin's first login, or rolled back after $ROLLBACK_MINUTES minutes).
@@ -1874,6 +2442,9 @@ main() {
     firewall) cmd_firewall "$@" ;;
     mirror)   cmd_mirror "$@" ;;
     ssh)      cmd_ssh "$@" ;;
+    tools)    cmd_tools "$@" ;;
+    apps)     cmd_apps "$@" ;;
+    backup)   cmd_backup "$@" ;;
     confirm)  ssh_change_pending || die "No SSH change is pending."; ssh_finalize; ok "SSH change kept (ports $SSH_PORTS)." ;;
     *) usage >&2; exit 2 ;;
   esac

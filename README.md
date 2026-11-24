@@ -2,7 +2,7 @@
 
 Turn a fresh **Ubuntu or Debian** server into a **hardened server that runs for years**: production backends, Dokploy nodes and monitoring hubs. It works with normal internet access or inside an **internal network** where only a mirror is reachable, and it keeps managing the server afterwards.
 
-> **Status: phase 1 of 5.** The *base* role (hardening, users, SSH, firewall, long-uptime tuning, download sources) is implemented. The *app* tools catalog, *monitor*, *dokploy-node* and *fleet* roles come next.
+> **Status: phase 2 of 5.** The *base* role (hardening, users, SSH, firewall, long-uptime tuning, download sources) and the *app* role (opt-in tools, app services, backups) are implemented. *monitor*, *dokploy-node* and *fleet* come next.
 
 | | |
 |---|---|
@@ -49,7 +49,12 @@ Default Nexus repository names (change them with `mirror set`):
 | Debian | `debian`, `debian-security` |
 | Docker / Grafana / NodeSource apt | `docker-apt`, `grafana-apt`, `nodesource-apt` |
 | Docker images | the registry on the mirror host |
-| npm / PyPI / Go / GitHub | `npm-proxy`, `pypi-proxy`, `go-proxy`, `github-proxy` |
+| npm / PyPI / Go modules | `npm-proxy`, `pypi-proxy`, `go-proxy` |
+| Go toolchain / GitHub downloads | `go-dl` (raw proxy of `https://dl.google.com/`), `github-proxy` (raw proxy of `https://github.com/`) |
+
+The apt proxies point at the upstream's root: `docker-apt` → `https://download.docker.com/`, `grafana-apt` → `https://apt.grafana.com/`, `nodesource-apt` → `https://deb.nodesource.com/`. Files are then requested by the same path as upstream.
+
+**Mirror login and language tools:** the login is written only to root-only places (apt `auth.conf.d`, `docker login`). npm/pip/Go settings are readable by every user, so they get the mirror URL but **not** the password. Allow anonymous read on the npm/PyPI/Go proxies, or let each app user log in. Docker's `registry-mirrors` can't send a login either. If the Docker proxy needs one, pull as `<mirror>/library/<image>`, or allow anonymous pull.
 
 A mirror login is stored root-only (`/etc/server-setup/secrets`, apt's `auth.conf.d`) and never passed on a command line.
 
@@ -70,6 +75,35 @@ A mirror login is stored root-only (`/etc/server-setup/secrets`, apt's `auth.con
   - **No automatic reboot** by default: `status` tells you when one is needed and why. Ubuntu Pro Livepatch (kernel fixes without a reboot) is optional where Canonical is reachable.
 - **Time:** chrony, with public pools or your internal NTP servers.
 
+## Tools (app role): opt-in
+
+```bash
+sudo server-setup tools list
+sudo server-setup tools install docker node --version 24
+sudo server-setup tools install go --version 1.25.4      # needed when go.dev isn't reachable
+sudo server-setup tools install apt:jq url:https://github.com/org/tool/releases/download/v1.2.3/tool_linux_amd64.tar.gz --sha256 <hash>
+```
+
+| Tool | From |
+|---|---|
+| `docker` | Docker's apt repo: CE, compose, buildx. Container logs capped (20 MB × 5); `live-restore` (off in Swarm) |
+| `node` | NodeSource apt repo (`--version 22|24…`); npm registry direct or mirror |
+| `python` | OS python3 + venv + pip + pipx, plus `uv` for everyone (from PyPI, direct or mirror) |
+| `go` | the official tarball, **checksum-verified**, in `/usr/local/go`; GOPROXY direct or mirror |
+| `nginx`, `caddy`, `certbot`, `postgresql`, `postgresql-client`, `redis`, `restic` | the OS repositories |
+| `apt:<pkg>` | any OS package |
+| `url:<tarball>` | unpacked into `--prefix` (default `/opt/<name>`); github.com URLs follow the GitHub source's route; `--sha256` to verify |
+
+**Docker and the firewall:** Docker publishes container ports with its own iptables rules, past ufw. server-setup adds rules to Docker's `DOCKER-USER` chain. Containers can talk out and to each other, but from outside only the ports opened with `server-setup firewall allow` reach a container. Everything else is dropped and logged as `[UFW DOCKER BLOCK]`. Use the container's port (the one after the `:` in `-p 8080:80`).
+
+**App services:** `server-setup apps add api --exec "/srv/api/bin/api --port 8080" --port 8080` creates:
+- a system user `api`
+- `/srv/api`
+- settings in `/etc/server-setup/apps/api.env`
+- a systemd service `app-api` in a sandbox: read-only system, writes only its directory, no privilege escalation, restarts forever, logs in the journal.
+
+**Backups:** `server-setup backup init` sets up daily restic backups to a local disk, SFTP or S3/MinIO, with a retention policy and a 1% data check after each run. The restic password goes to the credentials file. Keep it outside the server too.
+
 ## Commands
 
 ```text
@@ -81,6 +115,9 @@ update [--all]               Security updates now (--all: everything), restart w
 users list|add|remove|key|password <name> [--admin|--deploy]
 firewall list | allow <port>[/udp]... | deny <port>... | ssh-from [<cidr>...]
 mirror show|test|set|recheck
+tools list | install <tool>... [--version V] [--prefix DIR] [--sha256 H] | remove <tool>...
+apps list | add <name> --exec CMD [--port N] | remove <name>
+backup init|run|status|list
 ssh [--ports "22 9011"]      Re-apply SSH hardening / change ports (auto-rollback).
 confirm                      Keep a pending SSH change now.
 ```
@@ -99,7 +136,7 @@ confirm                      Keep a pending SSH change now.
 ## Roadmap
 
 1. ~~Framework, download sources, base role~~ ✅
-2. **app**: opt-in tools catalog (Docker + compose, Node, Python/uv, Go, nginx/Caddy, certbot, PostgreSQL, Redis, restic backups, any apt package, tarballs), each through direct-or-mirror.
+2. ~~**app**: opt-in tools catalog, app services, restic backups~~ ✅
 3. **monitor**: Grafana Alloy agent on every server. The stack (VictoriaMetrics, Loki, Grafana, Alertmanager, Uptime Kuma) can run on the same server or on a hub, or the agent can feed one you already have. `monitor move-to <hub>` when you outgrow one server.
 4. **dokploy-node**: prepares a server to be managed by a remote Dokploy panel, with all of Dokploy's setup steps done ahead of time so "Setup Server" works without internet.
 5. **fleet**: manage many servers from the hub.
