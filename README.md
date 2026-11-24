@@ -2,7 +2,7 @@
 
 Turn a fresh **Ubuntu or Debian** server into a **hardened server that runs for years**: production backends, Dokploy nodes and monitoring hubs. It works with normal internet access or inside an **internal network** where only a mirror is reachable, and it keeps managing the server afterwards.
 
-> **Status: 0.6.0.** All 5 roles are implemented, plus "under pressure" management. Tested on a real Ubuntu 24.04 server: base, app, monitor, and the CPU / memory / disk-full stress tests. See [Testing status](#testing-status).
+> **Status: 0.6.3.** All 5 roles are implemented, plus "under pressure" management. Tested on a real Ubuntu 24.04 server: base, app, monitor, and the CPU / memory / disk-full stress tests. See [Testing status](#testing-status).
 
 | | |
 |---|---|
@@ -255,28 +255,42 @@ confirm                      Keep a pending SSH change now.
 
 ## Testing status
 
-**Real server (Ubuntu 24.04, 2 CPU / 4 GB, with internet):**
-- **Setup:** a full `setup` with tools (docker, node, python), local monitoring, auditd and Lynis. Then a **re-run**, which keeps every earlier answer.
-- **SSH:** the 10-minute rollback confirmed by a real admin login, on two ports. SSH is limited to one IP, with no open-to-all rule left.
-- **Docker firewall:** published ports filtered by host port. `-p 80:80` and `-p 443:80` are reachable, `-p 8080:80` is blocked and logged.
+**Real server (Ubuntu 24.04, 2 CPU / 4 GB):**
+- **Setup:** a full `setup` (tools docker/node/python, local monitoring, auditd, Lynis), then a **re-run**, which keeps every earlier answer.
+- **SSH:**
+  - The admin login confirms the change, on two ports. SSH is limited to one IP, with no open-to-all rule.
+  - **Rollback:** answering "no" to a port change restores the old ports, closes the new port in the firewall, and restores the saved config.
+- **Docker firewall:** published ports filtered by host port. `80→80` and `443→80` are reachable, `8080→80` is blocked and logged.
 - **Monitoring:**
-  - The agent's metrics, container metrics and server-setup's own facts arrive in VictoriaMetrics.
-  - Journal and container logs arrive in Loki.
-  - vmalert loaded its rules, and Grafana provisioned its dashboard.
-- **Pressure:** the CPU, memory and disk-full stress tests above.
+  - `local`: metrics, container metrics, the journal and container logs, server-setup's facts, alert rules, and the Grafana dashboard.
+  - `hub`: the gateway uses TLS (Caddy's CA), refuses wrong or missing logins (401) and plain HTTP, and is open only to the allowed agent IPs. Its routes to VictoriaMetrics and Loki work.
+- **Under pressure:** the CPU / memory / disk-full stress tests above.
+- **fleet:**
+  - init / join / add / status / update, with the server managing itself.
+  - The forced command refuses anything else.
+  - `join` adds the manager to the SSH allow-list.
+- **dokploy-node prepare:**
+  - Swarm, `dokploy-network`, the Traefik image, nixpacks/railpack/pack, rclone.
+  - The panel user limited to the panel's IP, and 443/udp.
+- **Internal-network simulation** (outbound blocked except DNS and Nexus):
+  - `mirror test` shows that direct fails for every source, and each Nexus repo's status.
+  - `mirror recheck` stops with a clear message and **leaves apt untouched** when the mirror can't serve apt.
+  - `rescue` works offline.
 
-Bugs found on that server and fixed:
-- The Docker route rules let `8080→80` through.
+**Bugs found on the real server, all fixed:**
+- Docker's route rules let `8080→80` through.
 - The monitoring step failed on non-hub servers.
 - cAdvisor needs root.
 - Docker's config wasn't refreshed on a re-run.
+- A **Docker restart left every container stopped**, now fixed with `docker_restart`.
+- A fleet **deadlock** when the hub is its own member.
+- The SSH rollback left the rejected port open.
 
-Still to test on a server:
-- **Internal mode:** outbound blocked except to Nexus. It needs Nexus apt repos, which don't exist under the default names yet.
+**Still to test:**
+- The *successful* mirror path. It needs Nexus apt/npm/GitHub repos, or the real repo names.
 - Debian 12 and Ubuntu 22.04.
-- The **dokploy-node** role, with a real Dokploy panel.
-- **fleet** between two servers.
-- The **hub** monitoring mode, with agents joining it.
+- Dokploy's "Setup Server" from a real panel, including whether the panel needs SSH forwarding.
+- fleet and hub agents across two different servers.
 
 Also tested locally:
 
