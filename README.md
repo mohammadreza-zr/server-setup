@@ -2,7 +2,7 @@
 
 Turn a fresh **Ubuntu or Debian** server into a **hardened server that runs for years**: production backends, Dokploy nodes and monitoring hubs. It works with normal internet access or inside an **internal network** where only a mirror is reachable, and it keeps managing the server afterwards.
 
-> **Status: 0.6.3.** All 5 roles are implemented, plus "under pressure" management. Tested on a real Ubuntu 24.04 server: base, app, monitor, and the CPU / memory / disk-full stress tests. See [Testing status](#testing-status).
+> **Status: 0.6.5.** All 5 roles are implemented, plus "under pressure" management. Tested on a real Ubuntu 24.04 server, including a full setup on a freshly installed one: base, app, monitor, and the CPU / memory / disk-full stress tests. See [Testing status](#testing-status).
 
 | | |
 |---|---|
@@ -62,7 +62,7 @@ A mirror login is stored root-only (`/etc/server-setup/secrets`, apt's `auth.con
 
 - **Updates:** finishes any interrupted upgrade, upgrades everything, installs a small base set (all from the OS repos), and removes leftovers.
 - **Users:** one admin (sudo with a password, SSH key) and an optional **deploy** user (key only, no sudo, for CI/CD). sudo re-asks after 5 minutes and logs every use to `/var/log/sudo.log`.
-- **SSH:** key-only, no root login, only the `ssh-users` group, several ports possible. Only *local* forwarding is allowed (`ssh -L` to a database): no remote forwards, no agent forwarding, no X11. Changes **roll back automatically** after 10 minutes unless the admin logs in through the new config.
+- **SSH:** key-only, no root login, only the `ssh-users` group, several ports possible. Only *local* forwarding is allowed (`ssh -L` to a database): no remote forwards, no agent forwarding, no X11. Changes **roll back automatically** after 10 minutes unless the admin logs in through the new config. Any sshd still listening with an *older* config (left over when Ubuntu 24.04 switches from socket activation to `ssh.service`) is stopped; if one survives, the change is rolled back, and `status` warns about it.
 - **Firewall (ufw):** everything inbound blocked except SSH (optionally only from given IPs) and the ports you open. fail2ban guards SSH and works offline.
 - **Hardening:** sysctl network/kernel hardening (redirects, source routing, ptrace, BPF, kernel pointers, protected links), no core dumps, AppArmor on, empty login banner. Optional: auditd (who changed accounts, sudo, SSH, firewall) and a Lynis audit report.
 - **Long uptime:**
@@ -258,6 +258,8 @@ confirm                      Keep a pending SSH change now.
 
 **Real server (Ubuntu 24.04, 2 CPU / 4 GB):**
 - **Setup:** a full `setup` (tools docker/node/python, local monitoring, auditd, Lynis), then a **re-run**, which keeps every earlier answer.
+- **Fresh install (0.6.5):** a full `setup` on a freshly installed Ubuntu 24.04: all 16 steps OK. The leftover sshd from the socket-activation switch was found and stopped. Afterwards a single sshd holds both ports, root is refused on both, the admin logs in on both, and `status` reports only "reboot needed".
+  - Note: on a fresh server, Ubuntu's own OpenSSH package upgrade drops SSH for 2–3 minutes during the first run. Run `setup` inside `tmux` or `screen`; it keeps going and SSH comes back by itself.
 - **SSH:**
   - The admin login confirms the change, on two ports. SSH is limited to one IP, with no open-to-all rule.
   - **Rollback:** answering "no" to a port change restores the old ports, closes the new port in the firewall, and restores the saved config.
@@ -286,6 +288,7 @@ confirm                      Keep a pending SSH change now.
 - A **Docker restart left every container stopped**, now fixed with `docker_restart`.
 - A fleet **deadlock** when the hub is its own member.
 - The SSH rollback left the rejected port open.
+- **Security:** after the switch from `ssh.socket` to `ssh.service`, an **old sshd kept port 22 with the pre-hardening config** (root login still worked). Fixed in 0.6.4; that check wrongly counted systemd's own socket and blocked hardening on fresh installs, fixed in 0.6.5.
 
 **Still to test:**
 - The *successful* mirror path. It needs Nexus apt/npm/GitHub repos, or the real repo names.
@@ -302,4 +305,4 @@ Everything that can run without root was tested on Ubuntu 24.04:
 - **Dokploy sync:** reads the versions from Dokploy's current source, and they match the built-in defaults.
 - **Fleet:** forced command, `from=` restriction and forwarding refusal tested against a real (unprivileged) sshd.
 
-**Not yet verified:** a full `setup` as root on a disposable Ubuntu 22.04/24.04 and Debian 12 VM, with internet and with internet blocked except to Nexus. That covers the SSH rollback, ufw + DOCKER-USER rules, the Alloy agent and Caddy gateway configs (checked by structure, not by the real binaries), and Dokploy's "Setup Server" on a prepared node. On that test, also check whether the panel needs SSH forwarding for anything beyond running commands. Its key is set to `no-port-forwarding`. Run it on a test VM first.
+**Not yet verified:** Debian 12 and Ubuntu 22.04; a run with internet blocked where Nexus *can* serve every source; and Dokploy's "Setup Server" on a prepared node. On that test, also check whether the panel needs SSH forwarding for anything beyond running commands. Its key is set to `no-port-forwarding`. Run it on a test VM first.
