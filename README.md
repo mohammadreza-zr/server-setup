@@ -2,21 +2,29 @@
 
 Turn a fresh **Ubuntu or Debian** server into a **hardened server that runs for years**: production backends, Dokploy nodes and monitoring hubs. It works with normal internet access or inside an **internal network** where only a mirror is reachable, and it keeps managing the server afterwards.
 
-> **Status: 0.6.5.** All 5 roles are implemented, plus "under pressure" management. Tested on a real Ubuntu 24.04 server, including a full setup on a freshly installed one: base, app, monitor, and the CPU / memory / disk-full stress tests. See [Testing status](#testing-status).
+> **Status: 0.7.0.** All 5 roles are implemented, plus "under pressure" management. Tested on a real Ubuntu 24.04 server, including a full setup on a freshly installed one: base, app, monitor, and the CPU / memory / disk-full stress tests. See [Testing status](#testing-status) and the [changelog](CHANGELOG.md).
 
 | | |
 |---|---|
 | OS | Ubuntu 22.04 / 24.04 / 26.04 LTS, Debian 12 / 13 (amd64, arm64) |
 | Default | **nothing installed but hardening.** Everything else is opt-in |
-| Mirror | a Nexus repository manager (default `https://nexus.mrzdev.ir`), used only where needed |
+| Mirror | optional: your own Nexus repository manager, used only where a source can't be reached directly. None by default |
+| License | [MIT](LICENSE) |
 
 ## Quick start
 
-Copy `server-setup.sh` to the server and run it as root from that file (it is interactive):
+Download a release on the server, check it, and run it as root from that file (it is interactive, so don't pipe it into bash):
 
 ```bash
+V=0.7.0
+curl -fLO https://github.com/mohammadreza-zr/server-setup/releases/download/v$V/server-setup.sh
+curl -fLO https://github.com/mohammadreza-zr/server-setup/releases/download/v$V/SHA256SUMS
+sha256sum -c SHA256SUMS
 sudo bash server-setup.sh
 ```
+
+The server has no internet? Download the two files on your PC and copy them over with `scp`.
+On a fresh server, run it inside `tmux` or `screen`: Ubuntu's own OpenSSH upgrade can drop SSH for a few minutes during the first run.
 
 It asks every question first and shows the plan, then runs every step. A failed step is reported and the rest still run. It is safe to re-run. Afterwards it installs itself as `server-setup`:
 
@@ -27,9 +35,11 @@ sudo server-setup help
 
 ## Download sources: direct first, mirror only where needed
 
+On a server with normal internet access, leave the mirror empty and everything is used directly. In an internal network, give the URL of your own Nexus during setup (or later with `mirror set`).
+
 There is no "internal mode" switch. Each source is checked on its own:
 
-1. `apt` is tried with the server's **own OS repositories**. Third-party repos don't count, so a broken PPA can't force the mirror. If they answer, they are kept. If not, apt switches to the mirror's repositories, the other repos are set aside (originals are kept in `/etc/server-setup/backup/apt-original`), and the setup continues.
+1. `apt` is tried with the server's **own OS repositories**. Third-party repos don't count, so a broken PPA can't force the mirror. If they answer, they are kept. If not, and a mirror is set, apt switches to the mirror's repositories, the other repos are set aside (originals are kept in `/etc/server-setup/backup/apt-original`), and the setup continues.
 2. Time sync (NTP) uses the public pools if they answer; otherwise it uses the internal NTP servers you give.
 3. Later roles do the same for Docker Hub, ghcr.io, Docker's/Grafana's/NodeSource's apt repos, npm, PyPI, Go and GitHub downloads.
 
@@ -306,3 +316,11 @@ Everything that can run without root was tested on Ubuntu 24.04:
 - **Fleet:** forced command, `from=` restriction and forwarding refusal tested against a real (unprivileged) sshd.
 
 **Not yet verified:** Debian 12 and Ubuntu 22.04; a run with internet blocked where Nexus *can* serve every source; and Dokploy's "Setup Server" on a prepared node. On that test, also check whether the panel needs SSH forwarding for anything beyond running commands. Its key is set to `no-port-forwarding`. Run it on a test VM first.
+
+## Contributing
+
+Issues and pull requests are welcome. Please say which OS and version you ran it on, and attach the relevant part of `/var/log/server-setup.log` (it never contains secrets). Test changes on a throwaway VM first.
+
+## License
+
+[MIT](LICENSE) © 2026 mohammadreza-zr

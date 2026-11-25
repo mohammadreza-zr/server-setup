@@ -11,7 +11,7 @@
 # without secrets). Safe to re-run.
 #
 # Every download source (apt, NTP, later Docker/npm/PyPI/Go/GitHub) is tried DIRECTLY first;
-# only a source that does not answer is switched to the mirror (a Nexus by default).
+# only a source that does not answer is switched to the mirror (a Nexus you set; none by default).
 #
 # Afterwards it is installed as /usr/local/sbin/server-setup:   sudo server-setup help
 #
@@ -21,7 +21,7 @@
 set -Eeuo pipefail
 umask 022
 
-readonly SCRIPT_VERSION="0.6.5"
+readonly SCRIPT_VERSION="0.7.0"
 readonly INSTALL_PATH="/usr/local/sbin/server-setup"
 readonly LIB_DIR="/usr/local/lib/server-setup"
 readonly STATE_DIR="/etc/server-setup"
@@ -107,12 +107,11 @@ IN_SETUP=n
 defaults() { # fill every setting that is still empty
   : "${SSH_PORTS:=22}" "${AUTO_REBOOT:=n}" "${REBOOT_TIME:=04:00}" "${JOURNAL_MAX:=1G}"
   : "${AUDITD:=n}" "${LYNIS:=n}" "${ROLES:=base}"
-  : "${MIRROR_URL:=https://nexus.mrzdev.ir}"
   : "${REPO_UBUNTU:=ubuntu}" "${REPO_UBUNTU_SECURITY:=ubuntu-security}" "${REPO_UBUNTU_PORTS:=ubuntu-ports}"
   : "${REPO_DEBIAN:=debian}" "${REPO_DEBIAN_SECURITY:=debian-security}"
   : "${REPO_DOCKER_APT:=docker-apt}" "${REPO_GRAFANA_APT:=grafana-apt}" "${REPO_NODESOURCE_APT:=nodesource-apt}"
   : "${REPO_NPM:=npm-proxy}" "${REPO_PYPI:=pypi-proxy}" "${REPO_GO:=go-proxy}" "${REPO_GODL:=go-dl}" "${REPO_GITHUB:=github-proxy}"
-  [[ -n $MIRROR_DOCKER_REGISTRY ]] || MIRROR_DOCKER_REGISTRY=$(mirror_host)
+  mirror_registry_default
   local s v
   for s in $SOURCES; do v="SRC_$s"; [[ -n ${!v} ]] || printf -v "$v" auto; done
   mon_defaults
@@ -618,8 +617,15 @@ EOF
 # goes through the mirror. SRC_<name> = auto|direct|mirror|none (the admin's choice),
 # ROUTE_<name> = direct|mirror|none (in use now).
 # ----------------------------------------------------------------------------
-mirror_base() { local u=${MIRROR_URL%/}; [[ $u == *://* ]] || u="https://$u"; printf '%s' "$u"; }
+have_mirror() { [[ -n ${MIRROR_URL:-} ]]; }   # no mirror by default: every source is used directly
+mirror_base() { have_mirror || return 0; local u=${MIRROR_URL%/}; [[ $u == *://* ]] || u="https://$u"; printf '%s' "$u"; }
 mirror_host() { local u; u=$(mirror_base); u=${u#*://}; printf '%s' "${u%%/*}"; }
+mirror_label() { if have_mirror; then mirror_base; else printf 'none (direct only)'; fi; }
+mirror_registry_default() { # the Docker registry defaults to the mirror's host
+  if [[ -z $MIRROR_DOCKER_REGISTRY ]] && have_mirror; then MIRROR_DOCKER_REGISTRY=$(mirror_host); fi
+  return 0
+}
+no_mirror_hint() { printf 'no mirror is set (server-setup mirror set)'; }
 mirror_netrc() { # mirror_netrc <file> - writes the mirror login as a netrc file (0600); fails without one
   local pw; pw=$(secret_get mirror-password || true)
   [[ -n $MIRROR_USER && -n $pw ]] || return 1
@@ -649,7 +655,8 @@ direct_url() { # the public address a source is checked against
     github) printf 'https://github.com/' ;;
   esac
 }
-mirror_url_of() { # where a source lives on the mirror
+mirror_url_of() { # where a source lives on the mirror (empty: not on the mirror / no mirror)
+  have_mirror || return 0
   local b; b=$(mirror_base)
   case $1 in
     apt) printf '%s' "$(os_mirror_uris | cut -d' ' -f1)" ;;
@@ -727,6 +734,7 @@ apt_auth_render() { # netrc lines for the mirror (apt's auth.conf format)
 }
 apt_probe_direct() { local d rc=0; d=$(mktemp -d); apt_save_originals; apt_direct_parts "$d"; apt_probe "$d" || rc=1; rm -rf "$d"; return $rc; }
 apt_probe_mirror() {
+  have_mirror || return 1
   local d n rc=0; d=$(mktemp -d); n=$(mktemp -d)
   apt_mirror_parts "$d"; ( umask 077; apt_auth_render >"$n/mirror.conf" )
   apt_probe "$d" "$n" || rc=1
@@ -767,13 +775,15 @@ resolve_apt() {
   local want=$SRC_apt
   case $want in
     direct) apt_use_direct; ROUTE_apt=direct ;;
-    mirror) apt_use_mirror; ROUTE_apt=mirror ;;
+    mirror) have_mirror || die "apt is set to 'mirror' but $(no_mirror_hint)."
+            apt_use_mirror; ROUTE_apt=mirror ;;
     none) die "apt is set to 'none' - nothing can be installed. Change it: server-setup mirror set" ;;
     *)
       info "Checking the package sources directly (up to 2 minutes when there is no internet)..."
       if apt_probe_direct; then
         apt_use_direct; ROUTE_apt=direct; note "apt: the normal package sources work - used directly."
       else
+        have_mirror || die "The normal package sources do not answer and $(no_mirror_hint). Check the server's internet access, or set a mirror (a Nexus) for an internal network."
         warn "The normal package sources do not answer - trying the mirror $(mirror_base)."
         apt_probe_mirror || die "The mirror's apt repositories do not work either ($(os_mirror_uris)). Check the URL, repository names and login: server-setup mirror set   (details: $LOG_FILE)"
         apt_use_mirror; ROUTE_apt=mirror
@@ -833,7 +843,7 @@ source_check() {
   netrc=$(mktemp); if mirror_netrc "$netrc"; then auth=(--netrc-file "$netrc"); fi
   case $s in
     apt) if apt_probe_direct; then d=ok; else d=fail; fi
-         if apt_probe_mirror; then m=ok; else m=fail; fi ;;
+         if ! have_mirror; then m=-; elif apt_probe_mirror; then m=ok; else m=fail; fi ;;
     ntp) # shellcheck disable=SC2046
          if ntp_probe $(ntp_public); then d=ok; else d=fail; fi
          if [[ -z $NTP_SERVERS ]]; then m=-; elif ntp_probe $NTP_SERVERS; then m=ok; else m=fail; fi ;;
@@ -852,7 +862,7 @@ cmd_mirror() {
   case $action in
     show|"") mirror_show ;;
     test)
-      step "Testing every source directly and on the mirror $(mirror_base)"
+      step "Testing every source directly and on the mirror: $(mirror_label)"
       local s r
       printf '    %-22s %-8s %-8s %-14s %s\n' SOURCE WANTED IN-USE DIRECT MIRROR
       for s in $SOURCES; do
@@ -869,7 +879,7 @@ cmd_mirror() {
 
 mirror_show() {
   local s v
-  printf '    Mirror:   %s   login: %s\n' "$(mirror_base)" "${MIRROR_USER:-(none)}"
+  printf '    Mirror:   %s   login: %s\n' "$(mirror_label)" "${MIRROR_USER:-(none)}"
   printf '    Repos:    apt %s/%s (ports: %s), debian %s/%s\n' "$REPO_UBUNTU" "$REPO_UBUNTU_SECURITY" "$REPO_UBUNTU_PORTS" "$REPO_DEBIAN" "$REPO_DEBIAN_SECURITY"
   printf '              docker-apt %s, grafana-apt %s, nodesource %s, npm %s, pypi %s, go %s, go-dl %s, github %s\n' \
     "$REPO_DOCKER_APT" "$REPO_GRAFANA_APT" "$REPO_NODESOURCE_APT" "$REPO_NPM" "$REPO_PYPI" "$REPO_GO" "$REPO_GODL" "$REPO_GITHUB"
@@ -881,7 +891,14 @@ mirror_show() {
 
 mirror_prompt() {
   local pw="" k s v
-  prompt MIRROR_URL "Mirror base URL (a Nexus)" "$(mirror_base)" valid_url
+  prompt MIRROR_URL "Mirror base URL (a Nexus; empty = no mirror, '-' removes it)" "$(mirror_base)" valid_url_or_empty
+  if ! have_mirror; then
+    MIRROR_USER=""; secret_set mirror-password ""
+    prompt NTP_SERVERS "Internal NTP servers (space-separated, empty = public pools only)" "${NTP_SERVERS:-}" valid_host_list
+    info "No mirror: every source is used directly. Set one later with: server-setup mirror set"
+    return 0
+  fi
+  mirror_registry_default
   prompt MIRROR_USER "Mirror username (empty = anonymous)" "${MIRROR_USER:-}" accept_any
   if [[ -n $MIRROR_USER ]]; then
     printf '%s?%s Mirror password (empty = keep the current one): ' "$C_C" "$C_0" >/dev/tty
@@ -1603,12 +1620,16 @@ need_source() {
   local s=$1 v="SRC_$1" r="ROUTE_$1" cur
   cur=${!r}
   case ${!v} in
-    direct|mirror) printf -v "$r" '%s' "${!v}" ;;
+    direct) printf -v "$r" direct ;;
+    mirror) have_mirror || die "$(source_label "$s") is set to 'mirror' but $(no_mirror_hint)."
+            printf -v "$r" mirror ;;
     none) die "$(source_label "$s") is set to 'none' - change it: server-setup mirror set" ;;
     *)
+      if [[ $cur == mirror ]] && ! have_mirror; then cur=""; fi   # the mirror was removed
       if [[ -z $cur || ${RECHECK:-n} == y ]]; then
         if source_direct_ok "$s"; then printf -v "$r" direct
         elif source_mirror_ok "$s"; then printf -v "$r" mirror; note "$(source_label "$s"): not reachable directly - using the mirror."
+        elif ! have_mirror; then die "$(source_label "$s") is not reachable directly and $(no_mirror_hint). Check: server-setup mirror test"
         else die "$(source_label "$s") is reachable neither directly nor on the mirror ($(mirror_url_of "$s")). Check: server-setup mirror test"
         fi
       fi ;;
@@ -3412,9 +3433,15 @@ collect_answers() {
 
   step "4/5  Download sources"
   info "Every source (apt, time, later Docker/npm/PyPI/Go/GitHub) is tried directly first. Only a"
-  info "source that does not answer goes through the mirror - a Nexus repository manager."
-  prompt MIRROR_URL "Mirror base URL" "$(mirror_base)" valid_url
-  prompt MIRROR_USER "Mirror username (empty = anonymous)" "${MIRROR_USER:-}" accept_any
+  info "source that does not answer goes through the mirror - a Nexus repository manager. Leave it"
+  info "empty on a server with normal internet access."
+  prompt MIRROR_URL "Mirror base URL (empty = no mirror, '-' removes it)" "$(mirror_base)" valid_url_or_empty
+  if have_mirror; then
+    mirror_registry_default
+    prompt MIRROR_USER "Mirror username (empty = anonymous)" "${MIRROR_USER:-}" accept_any
+  else
+    MIRROR_USER=""
+  fi
   if [[ -n $MIRROR_USER ]]; then
     local pw=""
     printf '%s?%s Mirror password (empty = keep the current one): ' "$C_C" "$C_0" >/dev/tty
@@ -3446,7 +3473,7 @@ collect_answers() {
   info "SSH:                 ports $SSH_PORTS, keys only, no root login${SSH_ALLOW:+, only from $SSH_ALLOW}"
   info "Firewall:            SSH${OPEN_PORTS:+ + $OPEN_PORTS} inbound, everything else blocked"
   info "Hostname/timezone:   $NEW_HOSTNAME / $TIMEZONE"
-  info "Sources:             direct first, mirror $(mirror_base) as fallback${NTP_SERVERS:+; NTP $NTP_SERVERS}"
+  info "Sources:             $(if have_mirror; then echo "direct first, mirror $(mirror_base) as fallback"; else echo "direct only (no mirror)"; fi)${NTP_SERVERS:+; NTP $NTP_SERVERS}"
   info "Reboots:             $([[ $AUTO_REBOOT == y ]] && echo "automatic at $REBOOT_TIME when needed" || echo 'never automatic')"
   info "Extras:              auditd $AUDITD, Lynis $LYNIS${PRO_TOKEN:+, Ubuntu Pro + Livepatch}"
   info "Tools:               ${NEW_TOOLS:-(none - hardening only)}"
@@ -3637,7 +3664,7 @@ cmd_status() {
 
   step "Sources"
   local s line=""; for s in $SOURCES; do [[ $(route_of "$s") != unset ]] && line+="$s: $(route_of "$s")  "; done
-  info "${line:-not checked yet}   (mirror $(mirror_base); details: server-setup mirror test)"
+  info "${line:-not checked yet}   (mirror: $(mirror_label); details: server-setup mirror test)"
 
   step "Users"; users_table | sed 's/^/    /'
 
